@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background gradient -->
+  <defs>
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#667eea;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#764ba2;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="screenGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#f5f7fa;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#c3cfe2;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Main background with rounded corners -->
+  <rect x="0" y="0" width="512" height="512" rx="115" ry="115" fill="url(#bgGradient)" />
+
+  <!-- Screen frame -->
+  <rect x="86" y="96" width="340" height="240" rx="20" ry="20" fill="url(#screenGradient)" stroke="#fff" stroke-width="4" />
+
+  <!-- Recording indicator -->
+  <circle cx="430" cy="82" r="20" fill="#ff3b30">
+    <animate attributeName="opacity" values="1;0.3;1" dur="1.5s" repeatCount="indefinite" />
+  </circle>
+
+  <!-- Cursor icon -->
+  <path d="M 200 180 L 200 250 L 220 235 L 240 265 L 255 255 L 235 225 L 255 220 Z" fill="#667eea" stroke="#fff" stroke-width="2" />
+
+  <!-- Play button -->
+  <circle cx="256" cy="380" r="35" fill="#fff" />
+  <path d="M 248 365 L 248 395 L 275 380 Z" fill="#667eea" />
+
+  <!-- Video elements -->
+  <rect x="110" y="120" width="60" height="40" rx="5" fill="#667eea" opacity="0.7" />
+  <rect x="180" y="130" width="80" height="25" rx="5" fill="#764ba2" opacity="0.5" />
+  <rect x="270" y="120" width="50" height="50" rx="5" fill="#667eea" opacity="0.6" />
+
+  <!-- Zoom lines -->
+  <line x1="96" y1="70" x2="96" y2="85" stroke="#fff" stroke-width="3" stroke-linecap="round" />
+  <line x1="96" y1="70" x2="111" y2="70" stroke="#fff" stroke-width="3" stroke-linecap="round" />
+
+  <line x1="416" y1="442" x2="416" y2="427" stroke="#fff" stroke-width="3" stroke-linecap="round" />
+  <line x1="416" y1="442" x2="401" y2="442" stroke="#fff" stroke-width="3" stroke-linecap="round" />
+</svg>
