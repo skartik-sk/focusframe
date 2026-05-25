@@ -12,3 +12,18 @@ DerivedData/
 .env
 .env.*
 .netrc
+
+# Local browser/review artifacts generated during landing-page QA.
+/.playwright-mcp/
+/compare-*.png
+/focusframe-*.png
+/ref-*.png
+/compare-*.mp4
+/focusframe-*.mp4
+/ref-*.mp4
+/compare-*.webm
+/focusframe-*.webm
+/ref-*.webm
+
+# Raw local source recordings; optimized website media lives in frontend/public.
+/video/
