@@ -12,8 +12,8 @@ export const metadata: Metadata = {
     type: "website",
   },
   icons: {
-    icon: "/focusframe-app-icon.png",
-    apple: "/focusframe-app-icon.png",
+    icon: [{ url: "/icon.png", sizes: "512x512", type: "image/png" }],
+    apple: [{ url: "/apple-icon.png", sizes: "180x180", type: "image/png" }],
   },
 };
 
