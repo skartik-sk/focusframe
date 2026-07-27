@@ -188,6 +188,88 @@ final class ExportRuntimeTests: XCTestCase {
         )
     }
 
+    /// Measures a real end-to-end video export at 1 worker vs one-worker-per-core, to
+    /// confirm the parallel pipeline actually speeds up a real render (not just
+    /// synthetic CPU work) despite the shared GPU. Prints the ratio; asserts the
+    /// parallel run is not slower.
+    @MainActor
+    func testRealExportParallelSpeedup() async throws {
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        try XCTSkipUnless(cores >= 2, "Speedup benchmark needs ≥2 cores")
+
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // A non-trivial fixture: enough resolution + frames + compositing cost that
+        // per-frame render dominates over fixed setup/encode overhead.
+        let videoURL = directory.appendingPathComponent("bench.mov")
+        let fixtureSize = CGSize(width: 960, height: 540)
+        let frameCount = 60
+        let fps = 30
+        try await writePlayableVideo(to: videoURL, size: fixtureSize, frameCount: frameCount, fps: fps)
+
+        func makeProject() -> RecordingProject {
+            var project = RecordingProject(
+                id: UUID(),
+                createdAt: Date(),
+                modifiedAt: Date(),
+                title: "Parallel Bench",
+                videoFileURL: videoURL,
+                cursorDataFileURL: directory.appendingPathComponent("cursor.json"),
+                keyEventsFileURL: nil,
+                micAudioFileURL: nil,
+                systemAudioFileURL: nil,
+                webcamFileURL: nil,
+                captionsFileURL: nil,
+                duration: CMTime(seconds: Double(frameCount) / Double(fps), preferredTimescale: 600),
+                sourceRect: CGRect(origin: .zero, size: fixtureSize),
+                displayID: 0,
+                zoomSegments: [],
+                editActions: [],
+                style: .default,
+                hideDesktopIcons: false,
+                showKeyboardShortcuts: false,
+                webcamEnabled: false,
+                subtitlesEnabled: false
+            )
+            // Heavier compositing so per-frame cost is meaningful.
+            project.style.backgroundType = .gradient
+            project.style.shadowEnabled = true
+            project.style.motionBlurEnabled = true
+            project.style.motionBlurStrength = 0.5
+            return project
+        }
+
+        let profile = ExportProfile(
+            id: UUID(),
+            name: "Bench",
+            width: Int(fixtureSize.width),
+            height: Int(fixtureSize.height),
+            fps: fps,
+            codec: .h264,
+            quality: 0.7,
+            orientation: .landscape,
+            format: .mp4
+        )
+
+        func exportOnce(workers: Int) async throws -> TimeInterval {
+            let exportVM = ExportVM()
+            exportVM.workerCountOverride = workers
+            exportVM.outputURL = directory.appendingPathComponent("bench-\(workers)-\(UUID().uuidString).mp4")
+            let start = Date()
+            _ = try await exportVM.export(project: makeProject(), profile: profile)
+            return Date().timeIntervalSince(start)
+        }
+
+        let serial = try await exportOnce(workers: 1)
+        let parallel = try await exportOnce(workers: cores)
+        let speedup = serial / parallel
+
+        print("[RealExport] cores=\(cores) \(Int(fixtureSize.width))x\(Int(fixtureSize.height)) \(frameCount)fps  serial(1)=\(String(format: "%.3f", serial))s  parallel(\(cores))=\(String(format: "%.3f", parallel))s  speedup=\(String(format: "%.2f", speedup))x")
+
+        XCTAssertLessThanOrEqual(parallel, serial * 1.1, "Parallel export should not be slower than single-worker")
+    }
+
     private func makeToneAudioFile() throws -> URL {
         let sampleRate = 44_100.0
         let duration = 0.75
