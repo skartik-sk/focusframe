@@ -1,6 +1,7 @@
 import XCTest
 import AVFoundation
 import CoreGraphics
+import CoreVideo
 @testable import FocusFrame
 
 final class ExportRuntimeTests: XCTestCase {
@@ -631,5 +632,263 @@ final class ExportRuntimeTests: XCTestCase {
         context.fill(CGRect(x: size.width * 0.52, y: size.height * 0.52, width: size.width * 0.30, height: size.height * 0.20))
 
         return pixelBuffer
+    }
+
+    // MARK: - Frame-drop regression
+
+    /// Writes a CFR source where every frame is a unique, monotonically increasing gray
+    /// level (a linear ramp). Because the level is monotonic and non-cyclic, consecutive
+    /// frames differ by ~a constant — so a held (frozen) frame shows up as a near-zero
+    /// consecutive difference and a skipped frame as a roughly doubled one. This stays
+    /// unambiguous even though the renderer composites the source onto a background.
+    @MainActor
+    private func writeLinearRampVideo(
+        to url: URL,
+        size: CGSize,
+        frameCount: Int,
+        fps: Int
+    ) async throws {
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(
+            mediaType: .video,
+            outputSettings: [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: Int(size.width),
+                AVVideoHeightKey: Int(size.height)
+            ]
+        )
+        input.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
+                kCVPixelBufferWidthKey as String: Int(size.width),
+                kCVPixelBufferHeightKey as String: Int(size.height)
+            ]
+        )
+        guard writer.canAdd(input) else { throw ExportError.renderingFailed }
+        writer.add(input)
+        guard writer.startWriting() else {
+            throw writer.error ?? ExportError.renderingFailed
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        for frameIndex in 0..<frameCount {
+            while !input.isReadyForMoreMediaData {
+                try await Task.sleep(nanoseconds: 1_000_000)
+            }
+            let pixelBuffer = try makeLinearLevelPixelBuffer(
+                size: size,
+                frameIndex: frameIndex,
+                frameCount: frameCount
+            )
+            let time = CMTime(value: CMTimeValue(frameIndex), timescale: CMTimeScale(fps))
+            guard adaptor.append(pixelBuffer, withPresentationTime: time) else {
+                throw writer.error ?? ExportError.renderingFailed
+            }
+        }
+
+        input.markAsFinished()
+        await writer.finishWriting()
+        if writer.status != .completed {
+            throw writer.error ?? ExportError.renderingFailed
+        }
+    }
+
+    private func makeLinearLevelPixelBuffer(size: CGSize, frameIndex: Int, frameCount: Int) throws -> CVPixelBuffer {
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            Int(size.width),
+            Int(size.height),
+            kCVPixelFormatType_32ARGB,
+            [
+                kCVPixelBufferCGImageCompatibilityKey: true,
+                kCVPixelBufferCGBitmapContextCompatibilityKey: true
+            ] as CFDictionary,
+            &pixelBuffer
+        )
+        guard status == kCVReturnSuccess, let pixelBuffer else {
+            throw ExportError.renderingFailed
+        }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer),
+              let context = CGContext(
+                data: baseAddress,
+                width: Int(size.width),
+                height: Int(size.height),
+                bitsPerComponent: 8,
+                bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
+              ) else {
+            throw ExportError.renderingFailed
+        }
+
+        // Monotonic gray ramp: each frame is strictly brighter than the last.
+        let level = 0.1 + 0.8 * (CGFloat(frameIndex) / CGFloat(max(frameCount - 1, 1)))
+        context.setFillColor(CGColor(red: level, green: level, blue: level, alpha: 1))
+        context.fill(CGRect(origin: .zero, size: size))
+        return pixelBuffer
+    }
+
+    /// Returns the mean absolute per-channel difference (0...1) between each pair of
+    /// consecutive frames in the asset, in presentation order.
+    private static func consecutiveFrameMeanDifferences(at url: URL) async throws -> [Double] {
+        let asset = AVAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            return []
+        }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(
+            track: track,
+            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+        )
+        reader.add(output)
+        guard reader.startReading() else { return [] }
+
+        var differences: [Double] = []
+        var previous: [UInt8]?
+        while let sample = output.copyNextSampleBuffer(),
+              let buffer = CMSampleBufferGetImageBuffer(sample) {
+            CVPixelBufferLockBaseAddress(buffer, [.readOnly])
+            let width = CVPixelBufferGetWidth(buffer)
+            let height = CVPixelBufferGetHeight(buffer)
+            let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+            let bytes = [UInt8](
+                UnsafeRawBufferPointer(
+                    start: CVPixelBufferGetBaseAddress(buffer),
+                    count: bytesPerRow * height
+                )
+            )
+            CVPixelBufferUnlockBaseAddress(buffer, [.readOnly])
+
+            if let previous {
+                // Sample up to ~2k pixels for speed; only BGR channels (skip alpha).
+                let stride = max(1, (width * height) / 2_000)
+                var sum = 0
+                var count = 0
+                for y in 0..<height {
+                    for x in 0..<width where (y * width + x) % stride == 0 {
+                        let offset = y * bytesPerRow + x * 4
+                        for channel in 0..<3 {
+                            sum += abs(Int(bytes[offset + channel]) - Int(previous[offset + channel]))
+                            count += 1
+                        }
+                    }
+                }
+                differences.append(count > 0 ? Double(sum) / Double(count) / 255.0 : 0)
+            }
+            previous = bytes
+        }
+        return differences
+    }
+
+    /// Regression for the reported "frame drop on the final exported video".
+    ///
+    /// The export must show every source frame exactly once, in order. Two bugs broke that:
+    /// (1) `CMTime(seconds:preferredTimescale:)` truncated `frameIndex/fps` one tick low,
+    /// so `FrameSource` held the previous frame instead of advancing; (2) AVAssetReader
+    /// recycles a small pool of `CVPixelBuffer` objects, so the lazy `CIImage`s captured
+    /// during the serial decode read a *later* frame's content by render time. With a
+    /// monotonic gray source, consecutive export frames must all differ by ~the same step —
+    /// any near-zero difference is a held (dropped) frame, any ~doubled difference a skip.
+    @MainActor
+    func testExportDoesNotFreezeCFRSourceContent() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let fps = 30
+        let frameCount = 90
+        let size = CGSize(width: 320, height: 180)
+        let videoURL = directory.appendingPathComponent("linear-cfr.mov")
+        try await writeLinearRampVideo(to: videoURL, size: size, frameCount: frameCount, fps: fps)
+
+        var project = RecordingProject(
+            id: UUID(), createdAt: Date(), modifiedAt: Date(),
+            title: "CFR Freeze",
+            videoFileURL: videoURL,
+            cursorDataFileURL: directory.appendingPathComponent("cursor.json"),
+            keyEventsFileURL: nil, micAudioFileURL: nil, systemAudioFileURL: nil,
+            webcamFileURL: nil, captionsFileURL: nil,
+            duration: CMTime(seconds: Double(frameCount) / Double(fps), preferredTimescale: 600),
+            sourceRect: CGRect(origin: .zero, size: size), displayID: 0,
+            zoomSegments: [], editActions: [], style: .default,
+            hideDesktopIcons: false, showKeyboardShortcuts: false,
+            webcamEnabled: false, subtitlesEnabled: false
+        )
+        project.style.backgroundType = .gradient
+
+        let profile = ExportProfile(
+            id: UUID(),
+            name: "CFR Freeze Test",
+            width: 320,
+            height: 180,
+            fps: fps,
+            codec: .h264,
+            quality: 0.6,
+            orientation: .landscape,
+            format: .mp4
+        )
+
+        let exportVM = ExportVM()
+        let outputURL = directory.appendingPathComponent("linear-cfr-export.mp4")
+        exportVM.outputURL = outputURL
+        let exportedURL = try await exportVM.export(project: project, profile: profile)
+
+        let differences = try await Self.consecutiveFrameMeanDifferences(at: exportedURL)
+        XCTAssertEqual(differences.count, frameCount - 1, "Export should have \(frameCount - 1) frame gaps")
+
+        let sorted = differences.sorted()
+        let median = sorted[sorted.count / 2]
+        let held = differences.enumerated().filter { $0.element < median * 0.4 }.map { $0.offset }
+        let skipped = differences.enumerated().filter { $0.element > median * 1.6 }.map { $0.offset }
+
+        let preview = differences.prefix(12).map { String(format: "%.4f", $0) }.joined(separator: " ")
+        print("[CFR-Freeze] median=\(String(format: "%.4f", median)) first12=[\(preview)] held=\(held) skipped=\(skipped)")
+
+        XCTAssertTrue(median > 0.0005, "Consecutive frames must visibly advance (median diff \(median))")
+        XCTAssertTrue(held.isEmpty, "Export held (dropped) frames at gaps \(held); diffs \(differences)")
+        XCTAssertTrue(skipped.isEmpty, "Export skipped frames at gaps \(skipped); diffs \(differences)")
+    }
+
+    /// Exports a real local recording into the repo's `video/` folder using the fixed
+    /// pipeline, so the output can be inspected for frame drops. Gated behind an env var so
+    /// it never runs in the normal suite. Run with:
+    ///   FOCUSFRAME_EXPORT_TO_VIDEO=1 swift test --filter testExportRealRecordingToVideoFolder
+    @MainActor
+    func testExportRealRecordingToVideoFolder() async throws {
+        guard ProcessInfo.processInfo.environment["FOCUSFRAME_EXPORT_TO_VIDEO"] == "1" else {
+            throw XCTSkip("Set FOCUSFRAME_EXPORT_TO_VIDEO=1 to export a real recording into video/.")
+        }
+
+        let projects = try FileManager.default.loadRecordingProjects()
+        let project = projects.first(where: { $0.videoFileURL.path.contains("E0D96FB8") })
+            ?? projects.first
+        guard let project else {
+            throw XCTSkip("No local recording available to export.")
+        }
+
+        let repoRoot = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let videoDir = repoRoot.appendingPathComponent("video", isDirectory: true)
+        try? FileManager.default.createDirectory(at: videoDir, withIntermediateDirectories: true)
+
+        let exportVM = ExportVM()
+        let outputURL = videoDir.appendingPathComponent("focusframe_export_60fps_fixed.mp4")
+        exportVM.outputURL = outputURL
+
+        let start = Date()
+        let exportedURL = try await exportVM.export(project: project, profile: .web720p)
+        let elapsed = Date().timeIntervalSince(start)
+        let attributes = try FileManager.default.attributesOfItem(atPath: exportedURL.path)
+        let sizeMB = Double((attributes[.size] as? NSNumber)?.int64Value ?? 0) / 1_000_000
+
+        print("[VideoExport] wrote \(exportedURL.path) (\(String(format: "%.1f", sizeMB)) MB, \(String(format: "%.1f", elapsed))s)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: exportedURL.path))
     }
 }

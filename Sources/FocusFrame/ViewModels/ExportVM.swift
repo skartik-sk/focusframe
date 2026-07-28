@@ -32,7 +32,7 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
     private static let maxCaptionFileBytes: UInt64 = 10 * 1024 * 1024
     private static let maxKeyEventsFileBytes: UInt64 = 20 * 1024 * 1024
     private static let maxCursorDataFileBytes: UInt64 = 128 * 1024 * 1024
-    
+
     // MARK: - Parallel render support
 
     /// Read-only bundle of everything a worker needs to build one frame's inputs.
@@ -218,16 +218,18 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
                 self.output = nil
                 return
             }
-            // `alwaysCopiesSampleData` defaults to true, so each decoded pixel buffer is
-            // independent and safe to retain across reads (current/lookahead slots).
+            // CPU-backed BGRA output (no IOSurface/Metal compatibility). Hardware decode is
+            // still used, but frames land in independent, per-sample CPU buffers that are
+            // NOT pooled by the decoder — so a buffer retained in `current`/`lookahead`
+            // (and the lazy `CIImage` that references it, read later at render time) keeps
+            // its content. IOSurface-backed outputs are recycled by the decoder and produced
+            // frozen/stale frames in the export. CPU buffers also expose a base address.
             let output = AVAssetReaderTrackOutput(
                 track: track,
                 outputSettings: [
                     kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                     kCVPixelBufferWidthKey as String: max(1, Int(sourceSize.width)),
-                    kCVPixelBufferHeightKey as String: max(1, Int(sourceSize.height)),
-                    kCVPixelBufferMetalCompatibilityKey as String: true,
-                    kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()
+                    kCVPixelBufferHeightKey as String: max(1, Int(sourceSize.height))
                 ]
             )
             reader.add(output)
@@ -246,13 +248,80 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
                   let buffer = CMSampleBufferGetImageBuffer(sample) else {
                 return nil
             }
-            return (buffer, CMSampleBufferGetPresentationTimeStamp(sample))
+            let presentationTime = CMSampleBufferGetPresentationTimeStamp(sample)
+            // AVAssetReader recycles a small pool of CVPixelBuffer *objects* across reads
+            // (confirmed: base addresses repeat in a cycle). The lazy `CIImage` returned by
+            // `frame(at:)` references that object, and by the time the parallel render reads
+            // it, the decoder has overwritten the backing with a later frame — producing
+            // frozen/advanced content with correct presentation timestamps (the export
+            // "frame drop"). Snapshot each frame into a fresh, private buffer object so the
+            // retained content is immutable. CPU-backed output makes the base-address copy
+            // viable. Falls back to the live buffer only if allocation/copy fails.
+            guard let copied = Self.deepCopyPixelBuffer(buffer) else {
+                return (buffer, presentationTime)
+            }
+            return (copied, presentationTime)
+        }
+
+        /// Allocates a fresh CVPixelBuffer and copies `source`'s current pixels into it.
+        /// The result is a private object whose backing is never recycled, so it stays
+        /// valid for as long as it is retained (unlike the reader's pooled buffers).
+        private static func deepCopyPixelBuffer(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+            let width = CVPixelBufferGetWidth(source)
+            let height = CVPixelBufferGetHeight(source)
+            let format = CVPixelBufferGetPixelFormatType(source)
+
+            var copy: CVPixelBuffer?
+            let status = CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                width,
+                height,
+                format,
+                nil,
+                &copy
+            )
+            guard status == kCVReturnSuccess, let copy else { return nil }
+
+            CVPixelBufferLockBaseAddress(source, [.readOnly])
+            CVPixelBufferLockBaseAddress(copy, [])
+            defer {
+                CVPixelBufferUnlockBaseAddress(copy, [])
+                CVPixelBufferUnlockBaseAddress(source, [.readOnly])
+            }
+
+            guard let sourceBase = CVPixelBufferGetBaseAddress(source),
+                  let copyBase = CVPixelBufferGetBaseAddress(copy) else {
+                return nil
+            }
+
+            let sourceBytesPerRow = CVPixelBufferGetBytesPerRow(source)
+            let copyBytesPerRow = CVPixelBufferGetBytesPerRow(copy)
+            if sourceBytesPerRow == copyBytesPerRow {
+                memcpy(copyBase, sourceBase, sourceBytesPerRow * height)
+            } else {
+                let rowBytes = min(sourceBytesPerRow, copyBytesPerRow)
+                for row in 0..<height {
+                    memcpy(
+                        copyBase.advanced(by: row * copyBytesPerRow),
+                        sourceBase.advanced(by: row * sourceBytesPerRow),
+                        rowBytes
+                    )
+                }
+            }
+            return copy
         }
 
         /// Returns the source frame whose presentation covers `time`.
         func frame(at time: Double) -> CIImage {
             lock.lock()
-            let target = CMTime(seconds: time, preferredTimescale: 600)
+            // Round to the nearest 1/600 tick instead of using
+            // `CMTime(seconds:preferredTimescale:)`, which TRUNCATES the seconds→tick
+            // conversion. `Double(frameIndex)/fps` is rarely exact, so e.g. 11/30·600 =
+            // 219.9999… truncates to 219 — one tick below frame 11's presentation time.
+            // That made `while next.pts <= target` fail to advance, so the previous frame
+            // was held and the target frame dropped (the export "frame drop"). Rounding
+            // recovers the exact grid time.
+            let target = CMTime(value: CMTimeValue((time * 600).rounded()), timescale: 600)
 
             if reader?.status == .reading {
                 if !started {
