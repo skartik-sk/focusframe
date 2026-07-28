@@ -1,39 +1,35 @@
 import Foundation
 import CoreVideo
+import CoreImage
 
 /// Drives frame rendering across N workers, feeding results to a sink in strict
 /// ascending frame order.
 ///
-/// The previous export path rendered every frame serially on a single thread:
-/// decode → composite → append, one frame at a time, leaving the remaining cores
-/// idle. This pipeline parallelizes the per-frame work (decode + composite) across
-/// a pool of `workerCount` workers while preserving the encoder's hard requirement
-/// that frames arrive in presentation-time order.
+/// Two phases per chunk:
+///  1. **Serial decode** — `decode(index)` is called once per frame, in ascending
+///     order, before the chunk's composite. This is where the (necessarily serial)
+///     `AVAssetReader` runs; it is ~34× faster than per-frame `copyCGImage` seeks, so
+///     keeping it serial costs little while removing the old decode bottleneck.
+///  2. **Parallel composite** — each frame in the chunk is handed to a *distinct*
+///     worker and composited concurrently. No two concurrent tasks share a worker, so
+///     a worker's mutable Core Image state is never accessed concurrently.
 ///
-/// Strategy — ordered chunks:
-///  1. Frames are processed in chunks of size `workerCount`.
-///  2. Within a chunk every frame is handed to a *distinct* worker and rendered
-///     concurrently. Because no two concurrent tasks share a worker, a worker's
-///     mutable state (Core Image filters, caches) is never accessed concurrently.
-///  3. The chunk's task group acts as a barrier. Once it completes, the finished
-///     buffers are handed to `sink` in ascending index order, then the next chunk
-///     begins.
+/// The chunk's task group is a barrier; once it completes the finished buffers go to
+/// `sink` in ascending index order. Output is therefore identical to a serial render,
+/// and memory is bounded by `workerCount`.
 ///
-/// Output is therefore identical to a serial render: each frame's pixels are a pure
-/// function of its inputs, and ordering is enforced by the chunk barriers plus the
-/// sequential sink. Memory is bounded by `workerCount` (one buffer per worker).
-///
-/// Note on concurrency: `CVPixelBuffer` is a shared, mutable CoreVideo buffer and is
-/// explicitly non-`Sendable`, so it may not cross a task boundary as a return value.
-/// Workers therefore deposit their finished buffer into a locked, `@unchecked
-/// Sendable` slot store instead; the buffer never leaves the task that produced it
-/// until the barrier, after which it is consumed single-threaded.
+/// Concurrency note: `CIImage` (decoded source) and `CVPixelBuffer` (finished frame)
+/// are both non-`Sendable`, so they never cross a task boundary as values. The decoded
+/// source is handed to the worker through a locked `SlotStore` (`@unchecked Sendable`);
+/// the finished buffer the same way. Inside a task they are plain locals.
 struct ParallelFramePipeline<Worker: Sendable> {
     let workerCount: Int
     let makeWorker: @Sendable () -> Worker
-    /// Renders frame `index` and returns its pixel buffer. Called concurrently,
-    /// at most once per worker at a time.
-    let render: @Sendable (Worker, Int) throws -> CVPixelBuffer
+    /// Serial, in-order source decode. Called once per frame before its chunk's
+    /// parallel composite.
+    let decode: @Sendable (Int) throws -> CIImage
+    /// Composites one frame (parallel). `source` is the pre-decoded frame for `index`.
+    let render: @Sendable (Worker, Int, CIImage) throws -> CVPixelBuffer
     /// Receives each finished buffer in strict ascending `index` order.
     let sink: @Sendable (Int, CVPixelBuffer) async throws -> Void
 
@@ -56,15 +52,26 @@ struct ParallelFramePipeline<Worker: Sendable> {
 
             let chunkEnd = min(index + count, frameCount)
             let chunkSize = chunkEnd - index
-            let store = FrameSlotStore(count: chunkSize)
 
+            // Serial decode of the chunk's source frames, in order.
+            let sources = SlotStore<CIImage>(count: chunkSize)
+            for offset in 0..<chunkSize {
+                sources.set(offset, try decode(index + offset))
+            }
+
+            // Parallel composite. Each task reads its pre-decoded source from the store,
+            // composites, and deposits the finished buffer.
+            let buffers = SlotStore<CVPixelBuffer>(count: chunkSize)
             try await withThrowingTaskGroup(of: Void.self) { group in
                 for offset in 0..<chunkSize {
                     let frameIndex = index + offset
                     let worker = workers[offset]
                     group.addTask {
-                        let buffer = try render(worker, frameIndex)
-                        store.set(offset, buffer)
+                        guard let source = sources.take(offset) else {
+                            throw PipelineError.missingFrame(frameIndex)
+                        }
+                        let buffer = try render(worker, frameIndex, source)
+                        buffers.set(offset, buffer)
                     }
                 }
                 try await group.waitForAll()
@@ -73,7 +80,7 @@ struct ParallelFramePipeline<Worker: Sendable> {
             try isCancelled()
 
             for offset in 0..<chunkSize {
-                guard let buffer = store.take(offset) else {
+                guard let buffer = buffers.take(offset) else {
                     throw PipelineError.missingFrame(index + offset)
                 }
                 try await sink(index + offset, buffer)
@@ -86,32 +93,33 @@ struct ParallelFramePipeline<Worker: Sendable> {
 }
 
 enum PipelineError: Error {
-    /// A worker finished without producing a buffer for a frame in its chunk.
+    /// A frame could not be decoded or composited within its chunk.
     case missingFrame(Int)
 }
 
-/// Lock-protected, fixed-size slot store for finished pixel buffers. `@unchecked
-/// Sendable`: access is serialized through `lock`, so it is safe to share across
-/// the worker tasks of a single chunk.
-final class FrameSlotStore: @unchecked Sendable {
-    private var slots: [CVPixelBuffer?]
+/// Lock-protected, fixed-size slot store. `@unchecked Sendable`: access is serialized
+/// through `lock`, so it is safe to share across the tasks of a single chunk. Used for
+/// both the non-`Sendable` decoded source (`CIImage`) and finished frame
+/// (`CVPixelBuffer`), letting those values cross task boundaries safely.
+final class SlotStore<T>: @unchecked Sendable {
+    private var slots: [T?]
     private let lock = NSLock()
 
     init(count: Int) {
         slots = Array(repeating: nil, count: count)
     }
 
-    func set(_ offset: Int, _ buffer: CVPixelBuffer) {
+    func set(_ offset: Int, _ value: T) {
         lock.lock()
-        slots[offset] = buffer
+        slots[offset] = value
         lock.unlock()
     }
 
-    func take(_ offset: Int) -> CVPixelBuffer? {
+    func take(_ offset: Int) -> T? {
         lock.lock()
-        let buffer = slots[offset]
+        let value = slots[offset]
         slots[offset] = nil
         lock.unlock()
-        return buffer
+        return value
     }
 }

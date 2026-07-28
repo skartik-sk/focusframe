@@ -1,5 +1,6 @@
 import XCTest
 import CoreVideo
+import CoreImage
 @testable import FocusFrame
 
 /// Lock-protected mutable holder for observing pipeline behavior from `@Sendable`
@@ -21,6 +22,14 @@ private func makeBuffer() -> CVPixelBuffer {
     return pb!
 }
 
+private func makeSourceImage() -> CIImage {
+    CIImage(color: CIColor(red: 0.5, green: 0.5, blue: 0.5))
+        .cropped(to: CGRect(x: 0, y: 0, width: 2, height: 2))
+}
+
+/// Sink to keep the optimizer from eliminating the synthetic busy work.
+nonisolated(unsafe) private var blackHole: Double = 0
+
 final class ParallelFramePipelineTests: XCTestCase {
 
     /// A pipeline whose `render` finishes out of natural order: later indices sleep
@@ -35,7 +44,8 @@ final class ParallelFramePipelineTests: XCTestCase {
         let pipeline = ParallelFramePipeline<Int>(
             workerCount: workerCount,
             makeWorker: { 0 },
-            render: { _, index in
+            decode: { _ in makeSourceImage() },
+            render: { _, index, _ in
                 // Larger index -> shorter sleep -> finishes first.
                 let delay = UInt64(max(0, frameCount - index)) * 2_000_000
                 if delay > 0 { Thread.sleep(forTimeInterval: TimeInterval(delay) / 1_000_000_000) }
@@ -69,7 +79,8 @@ final class ParallelFramePipelineTests: XCTestCase {
         let pipeline = ParallelFramePipeline<Int>(
             workerCount: 4,
             makeWorker: { 0 },
-            render: { _, index in
+            decode: { _ in makeSourceImage() },
+            render: { _, index, _ in
                 rendered.mutate { $0.insert(index) }
                 return makeBuffer()
             },
@@ -91,7 +102,8 @@ final class ParallelFramePipelineTests: XCTestCase {
         let pipeline = ParallelFramePipeline<Int>(
             workerCount: 4,
             makeWorker: { 0 },
-            render: { _, _ in makeBuffer() },
+            decode: { _ in makeSourceImage() },
+            render: { _, _, _ in makeBuffer() },
             sink: { _, _ in sinkCount.mutate { $0 += 1 } }
         )
 
@@ -112,7 +124,8 @@ final class ParallelFramePipelineTests: XCTestCase {
         let pipeline = ParallelFramePipeline<Int>(
             workerCount: 4,
             makeWorker: { 0 },
-            render: { _, _ in makeBuffer() },
+            decode: { _ in makeSourceImage() },
+            render: { _, _, _ in makeBuffer() },
             sink: { _, _ in }
         )
 
@@ -137,7 +150,8 @@ final class ParallelFramePipelineTests: XCTestCase {
         let pipeline = ParallelFramePipeline<Int>(
             workerCount: 4,
             makeWorker: { 0 },
-            render: { _, _ in makeBuffer() },
+            decode: { _ in makeSourceImage() },
+            render: { _, _, _ in makeBuffer() },
             sink: { _, _ in sinkCount.mutate { $0 += 1 } }
         )
 
@@ -169,7 +183,8 @@ final class ParallelFramePipelineTests: XCTestCase {
         let pipeline = ParallelFramePipeline<Int>(
             workerCount: 0,
             makeWorker: { 0 },
-            render: { _, _ in makeBuffer() },
+            decode: { _ in makeSourceImage() },
+            render: { _, _, _ in makeBuffer() },
             sink: { index, _ in seen.mutate { $0.append(index) } }
         )
 
@@ -183,8 +198,8 @@ final class ParallelFramePipelineTests: XCTestCase {
     }
 
     /// Proves the engine actually renders frames concurrently (i.e. uses more than one
-    /// core) rather than serializing them. The render closure tracks the high-water
-    /// mark of simultaneously in-flight renders; with N>1 workers it must exceed 1.
+    /// core). The render closure tracks the high-water mark of simultaneously in-flight
+    /// renders; with N>1 workers it must exceed 1.
     func testFramesRenderConcurrently() async throws {
         let cores = ProcessInfo.processInfo.activeProcessorCount
         try XCTSkipUnless(cores >= 2, "Concurrency test needs ≥2 cores")
@@ -192,17 +207,16 @@ final class ParallelFramePipelineTests: XCTestCase {
         let frameCount = max(cores * 4, 8)
         let inFlight = LockBox<Int>(0)
         let maxConcurrency = LockBox<Int>(0)
-        let done = LockBox<Bool>(false)
 
         let pipeline = ParallelFramePipeline<Int>(
             workerCount: cores,
             makeWorker: { 0 },
-            render: { _, _ in
+            decode: { _ in makeSourceImage() },
+            render: { _, _, _ in
                 let current = inFlight.mutateAndReturn { c -> (Int, Int) in (c + 1, c + 1) }
                 _ = maxConcurrency.mutateAndReturn { m -> (Int, Int) in (max(m, current), max(m, current)) }
-                // Hold the slot briefly so workers overlap.
                 Thread.sleep(forTimeInterval: 0.01)
-                _ = inFlight.mutate { $0 -= 1 }
+                inFlight.mutate { $0 -= 1 }
                 return makeBuffer()
             },
             sink: { _, _ in }
@@ -213,7 +227,6 @@ final class ParallelFramePipelineTests: XCTestCase {
             isCancelled: { },
             onProgress: { _ in }
         )
-        done.mutate { $0 = true }
 
         XCTAssertGreaterThan(maxConcurrency.get(), 1, "Workers must render frames concurrently")
     }
@@ -226,19 +239,18 @@ final class ParallelFramePipelineTests: XCTestCase {
         try XCTSkipUnless(cores >= 2, "Speedup test needs ≥2 cores")
 
         let frameCount = cores * 6
-        // Enough work per frame to dwarf scheduling overhead.
-        @Sendable func heavyRender(_: Int, _ index: Int) -> CVPixelBuffer {
-            var acc: Double = Double(index)
-            for i in 0..<2_000_000 { acc += Double(i) * 0.000_000_1 }
-            blackHole = acc
-            return makeBuffer()
-        }
 
         func time(_ workers: Int) async throws -> TimeInterval {
             let pipeline = ParallelFramePipeline<Int>(
                 workerCount: workers,
                 makeWorker: { 0 },
-                render: heavyRender,
+                decode: { _ in makeSourceImage() },
+                render: { _, index, _ in
+                    var acc: Double = Double(index)
+                    for i in 0..<2_000_000 { acc += Double(i) * 0.000_000_1 }
+                    blackHole = acc
+                    return makeBuffer()
+                },
                 sink: { _, _ in }
             )
             let start = Date()
@@ -256,11 +268,8 @@ final class ParallelFramePipelineTests: XCTestCase {
     }
 }
 
-/// Sink to keep the optimizer from eliminating the synthetic busy work.
-nonisolated(unsafe) private var blackHole: Double = 0
-
 private extension LockBox {
-    /// Map-and-return-under-lock helper for the cancellation test.
+    /// Map-and-return-under-lock helper.
     func mutateAndReturn<U>(_ f: (T) -> (T, U)) -> U {
         lock.lock()
         let (next, result) = f(value)

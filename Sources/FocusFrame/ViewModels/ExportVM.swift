@@ -60,7 +60,6 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
     private struct RenderWorker: @unchecked Sendable {
         let renderer: VideoRenderer
         let ciContext: CIContext
-        let sourceImageGenerator: AVAssetImageGenerator
         let webcamImageGenerator: AVAssetImageGenerator?
     }
 
@@ -165,15 +164,7 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private static func makeVideoRenderWorker(
-        sourceAsset: AVAsset,
-        webcamAsset: AVAsset?
-    ) -> RenderWorker {
-        let sourceGenerator = AVAssetImageGenerator(asset: sourceAsset)
-        sourceGenerator.appliesPreferredTrackTransform = true
-        sourceGenerator.requestedTimeToleranceAfter = CMTime(seconds: 0.01, preferredTimescale: 600)
-        sourceGenerator.requestedTimeToleranceBefore = CMTime(seconds: 0.01, preferredTimescale: 600)
-
+    private static func makeVideoRenderWorker(webcamAsset: AVAsset?) -> RenderWorker {
         let webcamGenerator: AVAssetImageGenerator? = webcamAsset.map { asset in
             let generator = AVAssetImageGenerator(asset: asset)
             generator.appliesPreferredTrackTransform = true
@@ -193,9 +184,98 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
         return RenderWorker(
             renderer: VideoRenderer(),
             ciContext: ciContext,
-            sourceImageGenerator: sourceGenerator,
             webcamImageGenerator: webcamGenerator
         )
+    }
+
+    /// Streams hardware-decoded source frames from an asset via `AVAssetReader` — about
+    /// 34× faster than per-frame `AVAssetImageGenerator.copyCGImage` seeks, which was
+    /// the real export bottleneck. Advances in presentation order; `frame(at:)` returns
+    /// the source frame whose presentation covers the requested time.
+    /// `@unchecked Sendable`: accessed serially (only from the pipeline's serial decode
+    /// phase). Falls back to a generator seek if the reader cannot start or is exhausted.
+    private final class FrameSource: @unchecked Sendable {
+        private let reader: AVAssetReader?
+        private let output: AVAssetReaderTrackOutput?
+        private let fallback: AVAssetImageGenerator
+        private let lock = NSLock()
+        private var current: (CVPixelBuffer, CMTime)?
+        private var lookahead: (CVPixelBuffer, CMTime)?
+        private var started = false
+
+        init(asset: AVAsset, sourceSize: CGSize) async {
+            let fallback = AVAssetImageGenerator(asset: asset)
+            fallback.appliesPreferredTrackTransform = true
+            fallback.requestedTimeToleranceBefore = CMTime(seconds: 0.01, preferredTimescale: 600)
+            fallback.requestedTimeToleranceAfter = CMTime(seconds: 0.01, preferredTimescale: 600)
+            self.fallback = fallback
+
+            guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+                  let reader = try? AVAssetReader(asset: asset) else {
+                // No readable video track or reader could not be created: `frame(at:)`
+                // will fall back to the generator (or a gray frame), matching prior behavior.
+                self.reader = nil
+                self.output = nil
+                return
+            }
+            // `alwaysCopiesSampleData` defaults to true, so each decoded pixel buffer is
+            // independent and safe to retain across reads (current/lookahead slots).
+            let output = AVAssetReaderTrackOutput(
+                track: track,
+                outputSettings: [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                    kCVPixelBufferWidthKey as String: max(1, Int(sourceSize.width)),
+                    kCVPixelBufferHeightKey as String: max(1, Int(sourceSize.height)),
+                    kCVPixelBufferMetalCompatibilityKey as String: true,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()
+                ]
+            )
+            reader.add(output)
+            guard reader.startReading() else {
+                self.reader = nil
+                self.output = nil
+                return
+            }
+            self.reader = reader
+            self.output = output
+        }
+
+        private func readNext() -> (CVPixelBuffer, CMTime)? {
+            guard let output,
+                  let sample = output.copyNextSampleBuffer(),
+                  let buffer = CMSampleBufferGetImageBuffer(sample) else {
+                return nil
+            }
+            return (buffer, CMSampleBufferGetPresentationTimeStamp(sample))
+        }
+
+        /// Returns the source frame whose presentation covers `time`.
+        func frame(at time: Double) -> CIImage {
+            lock.lock()
+            let target = CMTime(seconds: time, preferredTimescale: 600)
+
+            if reader?.status == .reading {
+                if !started {
+                    current = readNext()
+                    lookahead = readNext()
+                    started = true
+                }
+                while let next = lookahead, next.1 <= target {
+                    current = next
+                    lookahead = readNext()
+                }
+                if let cur = current {
+                    lock.unlock()
+                    return CIImage(cvPixelBuffer: cur.0)
+                }
+            }
+            lock.unlock()
+
+            if let cg = try? fallback.copyCGImage(at: target, actualTime: nil) {
+                return CIImage(cgImage: cg)
+            }
+            return CIImage(color: .init(cgColor: CGColor(gray: 0.2, alpha: 1.0)))
+        }
     }
 
     private func webcamAsset(for project: RecordingProject) -> AVAsset? {
@@ -206,14 +286,15 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
         return AVAsset(url: url)
     }
 
-    /// Builds the full `FrameInputs` for a frame, including decoding the source
-    /// (and webcam) frame via the worker's own image generators. Shared by the video
-    /// and GIF paths so per-frame output is identical across both.
+    /// Builds the full `FrameInputs` for a frame from a pre-decoded source image and the
+    /// worker's webcam generator. Shared by the video and GIF paths so per-frame output
+    /// is identical across both.
     private func frameInputs(
         worker: RenderWorker,
         frameIndex: Int,
+        sourceFrame: CIImage,
         context: RenderContext
-    ) throws -> (inputs: VideoRenderer.FrameInputs, style: StylePreset) {
+    ) -> (inputs: VideoRenderer.FrameInputs, style: StylePreset) {
         let outputTime = Double(frameIndex) / Double(context.fps)
         let sourceTime = sourceTime(for: outputTime, timeline: context.timeline)
         let frameTransform = frameTransform(at: sourceTime, transforms: context.transforms)
@@ -223,16 +304,6 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
         let resolvedEffects = EffectSegmentResolver.resolve(project: context.project, at: sourceTime)
         let style = resolvedEffects.style
         let activeShortcuts = activeShortcuts(at: sourceTime, events: context.keyEvents, style: style)
-
-        let cmTime = CMTime(seconds: sourceTime, preferredTimescale: 600)
-        let sourceFrame: CIImage
-        do {
-            let cgImage = try worker.sourceImageGenerator.copyCGImage(at: cmTime, actualTime: nil)
-            sourceFrame = CIImage(cgImage: cgImage)
-        } catch {
-            sourceFrame = CIImage(color: .init(cgColor: CGColor(gray: 0.2, alpha: 1.0)))
-                .cropped(to: CGRect(origin: .zero, size: context.sourceSize))
-        }
 
         let inputs = VideoRenderer.FrameInputs(
             sourceFrame: sourceFrame,
@@ -268,10 +339,16 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
     private func renderVideoFrame(
         worker: RenderWorker,
         frameIndex: Int,
+        sourceFrame: CIImage,
         context: RenderContext
     ) throws -> CVPixelBuffer {
         guard let pool = context.bufferPool else { throw ExportError.renderingFailed }
-        let (inputs, style) = try frameInputs(worker: worker, frameIndex: frameIndex, context: context)
+        let (inputs, style) = frameInputs(
+            worker: worker,
+            frameIndex: frameIndex,
+            sourceFrame: sourceFrame,
+            context: context
+        )
 
         var pixelBuffer: CVPixelBuffer?
         let createStatus = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
@@ -293,9 +370,15 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
     private func renderGifFrame(
         worker: RenderWorker,
         frameIndex: Int,
+        sourceFrame: CIImage,
         context: RenderContext
     ) throws -> CVPixelBuffer {
-        let (inputs, style) = try frameInputs(worker: worker, frameIndex: frameIndex, context: context)
+        let (inputs, style) = frameInputs(
+            worker: worker,
+            frameIndex: frameIndex,
+            sourceFrame: sourceFrame,
+            context: context
+        )
         guard let buffer = worker.renderer.renderFrame(
             inputs: inputs,
             config: style,
@@ -419,9 +502,11 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
             bufferPool: pool
         )
 
-        // One worker per logical core: decode + composite now run in parallel across
-        // the whole machine instead of on a single thread.
+        // One worker per logical core. Source frames are decoded once, serially, by a
+        // single AVAssetReader-backed FrameSource (~34× faster than per-frame
+        // copyCGImage); compositing runs in parallel across the workers.
         let workerCount = max(1, workerCountOverride ?? ProcessInfo.processInfo.activeProcessorCount)
+        let frameSource = await FrameSource(asset: sourceAsset, sourceSize: sourceSize)
         let telemetry = ExportTelemetry(total: totalFrames)
         await MainActor.run { self.coresInUse = workerCount }
 
@@ -439,16 +524,25 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
 
         let pipeline = ParallelFramePipeline<RenderWorker>(
             workerCount: workerCount,
-            makeWorker: { [sourceURL = project.videoFileURL, webcamURL = project.webcamFileURL] in
-                let sourceAsset = AVAsset(url: sourceURL)
+            makeWorker: { [webcamURL = project.webcamFileURL] in
                 let webcamAsset = webcamURL.flatMap {
                     FileManager.default.fileExists(atPath: $0.path) ? AVAsset(url: $0) : nil
                 }
-                return Self.makeVideoRenderWorker(sourceAsset: sourceAsset, webcamAsset: webcamAsset)
+                return Self.makeVideoRenderWorker(webcamAsset: webcamAsset)
             },
-            render: { worker, frameIndex in
+            decode: { frameIndex in
+                let outputTime = Double(frameIndex) / Double(context.fps)
+                let sourceTime = self.sourceTime(for: outputTime, timeline: context.timeline)
+                return frameSource.frame(at: sourceTime)
+            },
+            render: { worker, frameIndex, sourceFrame in
                 try autoreleasepool {
-                    try self.renderVideoFrame(worker: worker, frameIndex: frameIndex, context: context)
+                    try self.renderVideoFrame(
+                        worker: worker,
+                        frameIndex: frameIndex,
+                        sourceFrame: sourceFrame,
+                        context: context
+                    )
                 }
             },
             sink: { frameIndex, buffer in
@@ -556,6 +650,7 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
         )
 
         let workerCount = max(1, workerCountOverride ?? ProcessInfo.processInfo.activeProcessorCount)
+        let frameSource = await FrameSource(asset: sourceAsset, sourceSize: sourceSize)
         let telemetry = ExportTelemetry(total: totalFrames)
         await MainActor.run { self.coresInUse = workerCount }
 
@@ -572,16 +667,25 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
 
         let pipeline = ParallelFramePipeline<RenderWorker>(
             workerCount: workerCount,
-            makeWorker: { [sourceURL = project.videoFileURL, webcamURL = project.webcamFileURL] in
-                let sourceAsset = AVAsset(url: sourceURL)
+            makeWorker: { [webcamURL = project.webcamFileURL] in
                 let webcamAsset = webcamURL.flatMap {
                     FileManager.default.fileExists(atPath: $0.path) ? AVAsset(url: $0) : nil
                 }
-                return Self.makeVideoRenderWorker(sourceAsset: sourceAsset, webcamAsset: webcamAsset)
+                return Self.makeVideoRenderWorker(webcamAsset: webcamAsset)
             },
-            render: { worker, frameIndex in
+            decode: { frameIndex in
+                let outputTime = Double(frameIndex) / Double(context.fps)
+                let sourceTime = self.sourceTime(for: outputTime, timeline: context.timeline)
+                return frameSource.frame(at: sourceTime)
+            },
+            render: { worker, frameIndex, sourceFrame in
                 try autoreleasepool {
-                    try self.renderGifFrame(worker: worker, frameIndex: frameIndex, context: context)
+                    try self.renderGifFrame(
+                        worker: worker,
+                        frameIndex: frameIndex,
+                        sourceFrame: sourceFrame,
+                        context: context
+                    )
                 }
             },
             sink: { _, buffer in
