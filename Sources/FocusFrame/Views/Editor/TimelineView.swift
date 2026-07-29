@@ -60,12 +60,14 @@ struct TimelineView: View {
                 ScrollViewReader { scrollProxy in
                     let bodyWidth = max(0, geometry.size.width - gutterWidth)
                     let contentWidth = max(bodyWidth, bodyWidth * CGFloat(clampedTimelineZoomScale))
+                    let specs = laneSpecs
+                    let contentHeight = specs.reduce(CGFloat(0)) { $0 + $1.height }
 
                     ScrollView(.vertical, showsIndicators: false) {
                         HStack(spacing: 0) {
                             // Fixed left gutter — pinned horizontally, scrolls vertically with content.
                             VStack(spacing: 0) {
-                                ForEach(laneSpecs) { spec in
+                                ForEach(specs) { spec in
                                     TimelineGutterRow(spec: spec)
                                 }
                             }
@@ -76,16 +78,25 @@ struct TimelineView: View {
                             ScrollView(.horizontal, showsIndicators: false) {
                                 ZStack(alignment: .topLeading) {
                                     VStack(spacing: 0) {
-                                        ForEach(laneSpecs) { spec in
+                                        ForEach(specs) { spec in
                                             spec.bodyContent
                                                 .frame(width: contentWidth, height: spec.height)
                                         }
                                     }
 
-                                    playheadOverlay(width: contentWidth)
-                                    selectionBandOverlay(width: contentWidth)
+                                    // Only this overlay observes the per-tick playback
+                                    // clock; the lanes above stay still while playing.
+                                    TimelinePlayheadOverlay(
+                                        playback: editorVM.playback,
+                                        duration: editorVM.duration,
+                                        totalHeight: contentHeight,
+                                        rulerHeight: rulerHeight,
+                                        selectedRangeStart: editorVM.selectedRangeStart,
+                                        selectedRangeEnd: editorVM.selectedRangeEnd,
+                                        width: contentWidth
+                                    )
                                 }
-                                .frame(width: contentWidth, height: timelineHeight)
+                                .frame(width: contentWidth, height: contentHeight)
                             }
                         }
                     }
@@ -375,16 +386,13 @@ struct TimelineView: View {
             gutterIcon: icon,
             gutterTrailing: trailing,
             bodyContent: AnyView(
-                AudioWaveformView(
+                PlaybackWaveformLane(
+                    playback: editorVM.playback,
                     audioURL: url,
-                    currentTime: editorVM.playheadTime,
                     duration: max(editorVM.duration, 0.001),
                     editActions: editorVM.project.editActions,
-                    loops: loops,
-                    muteCutRanges: true
+                    loops: loops
                 )
-                .clipShape(RoundedRectangle(cornerRadius: 5))
-                .padding(.horizontal, 4)
             ),
             groupAccent: .teal
         )
@@ -606,48 +614,8 @@ struct TimelineView: View {
         }
     }
 
-    // MARK: - Overlays (single playhead + selection band)
-
-    @ViewBuilder
-    private func playheadOverlay(width: CGFloat) -> some View {
-        let x = playheadX(width: width)
-        Rectangle()
-            .fill(Color.clear)
-            .frame(width: 1, height: timelineHeight)
-            .position(x: x, y: timelineHeight / 2)
-            .id(TimelineScrollTarget.playhead)
-            .allowsHitTesting(false)
-
-        Rectangle()
-            .fill(Color.accentColor)
-            .frame(width: 1.5)
-            .frame(height: timelineHeight)
-            .position(x: x, y: timelineHeight / 2)
-            .allowsHitTesting(false)
-
-        Circle()
-            .fill(Color.accentColor)
-            .frame(width: 11, height: 11)
-            .overlay(Circle().fill(Color.white).frame(width: 3.5, height: 3.5))
-            .shadow(color: .black.opacity(0.3), radius: 1.5, y: 1)
-            .position(x: x, y: rulerHeight / 2)
-            .allowsHitTesting(false)
-    }
-
-    @ViewBuilder
-    private func selectionBandOverlay(width: CGFloat) -> some View {
-        if let range = selectedRangeBand(width: width) {
-            Rectangle()
-                .fill(Color.accentColor.opacity(0.12))
-                .overlay(
-                    Rectangle()
-                        .stroke(Color.accentColor.opacity(0.45), lineWidth: 1)
-                )
-                .frame(width: range.width, height: timelineHeight)
-                .position(x: range.midX, y: timelineHeight / 2)
-                .allowsHitTesting(false)
-        }
-    }
+    // Playhead + selection-band overlays live in TimelinePlayheadOverlay (the only
+    // timeline subview that observes the per-tick playback clock).
 
     // MARK: - Controls bar
 
@@ -741,10 +709,6 @@ struct TimelineView: View {
 
     private var safeDuration: Double { max(editorVM.duration, 0.001) }
 
-    private func playheadX(width: CGFloat) -> CGFloat {
-        CGFloat(max(0, min(1, editorVM.playheadTime / safeDuration))) * width
-    }
-
     private var snapEnabled: Bool { !snapDisabled }
 
     private var timelineHeight: CGFloat {
@@ -796,17 +760,6 @@ struct TimelineView: View {
                 scrollProxy.scrollTo(TimelineScrollTarget.playhead, anchor: .center)
             }
         }
-    }
-
-    private func selectedRangeBand(width: CGFloat) -> CGRect? {
-        guard let start = editorVM.selectedRangeStart,
-              let end = editorVM.selectedRangeEnd,
-              abs(end - start) >= 0.05 else {
-            return nil
-        }
-        let left = min(start, end) / safeDuration * width
-        let bandWidth = max(2, abs(end - start) / safeDuration * width)
-        return CGRect(x: left, y: 0, width: bandWidth, height: timelineHeight)
     }
 
     // MARK: - Modifier key monitoring
@@ -952,6 +905,101 @@ struct ClipDescriptor: Identifiable {
             onRemove: onRemove,
             dragFeedback: dragFeedback
         )
+    }
+}
+
+// MARK: - Playhead overlay (the only timeline view that re-renders per playback tick)
+
+/// Renders the single global playhead (line + head) and the drag-selection band. This is
+/// the only part of the timeline that observes the high-frequency `PlaybackClock`, so the
+/// filmstrip, clips, gutter, and ruler stay completely still while a recording plays.
+struct TimelinePlayheadOverlay: View {
+    @ObservedObject var playback: PlaybackClock
+    let duration: Double
+    let totalHeight: CGFloat
+    let rulerHeight: CGFloat
+    let selectedRangeStart: Double?
+    let selectedRangeEnd: Double?
+    let width: CGFloat
+
+    var body: some View {
+        let x = playheadX
+        ZStack(alignment: .topLeading) {
+            // Scroll anchor (invisible).
+            Rectangle()
+                .fill(Color.clear)
+                .frame(width: 1, height: totalHeight)
+                .position(x: x, y: totalHeight / 2)
+                .id(TimelineScrollTarget.playhead)
+                .allowsHitTesting(false)
+
+            Rectangle()
+                .fill(Color.accentColor)
+                .frame(width: 1.5)
+                .frame(height: totalHeight)
+                .position(x: x, y: totalHeight / 2)
+                .allowsHitTesting(false)
+
+            Circle()
+                .fill(Color.accentColor)
+                .frame(width: 11, height: 11)
+                .overlay(Circle().fill(Color.white).frame(width: 3.5, height: 3.5))
+                .shadow(color: .black.opacity(0.3), radius: 1.5, y: 1)
+                .position(x: x, y: rulerHeight / 2)
+                .allowsHitTesting(false)
+
+            if let band = selectionBandRect {
+                Rectangle()
+                    .fill(Color.accentColor.opacity(0.12))
+                    .overlay(
+                        Rectangle()
+                            .stroke(Color.accentColor.opacity(0.45), lineWidth: 1)
+                    )
+                    .frame(width: band.width, height: totalHeight)
+                    .position(x: band.midX, y: totalHeight / 2)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+
+    private var playheadX: CGFloat {
+        CGFloat(max(0, min(1, playback.time / max(duration, 0.001)))) * width
+    }
+
+    private var selectionBandRect: CGRect? {
+        guard let start = selectedRangeStart,
+              let end = selectedRangeEnd,
+              abs(end - start) >= 0.05 else {
+            return nil
+        }
+        let safe = max(duration, 0.001)
+        let left = min(start, end) / safe * width
+        let bandWidth = max(2, abs(end - start) / safe * width)
+        return CGRect(x: left, y: 0, width: bandWidth, height: totalHeight)
+    }
+}
+
+/// Audio waveform lane that tracks the playhead. Observes `PlaybackClock` so its
+/// played-region colour advances during playback without re-rendering the rest of the
+/// timeline.
+struct PlaybackWaveformLane: View {
+    @ObservedObject var playback: PlaybackClock
+    let audioURL: URL?
+    let duration: Double
+    let editActions: [EditAction]
+    let loops: Bool
+
+    var body: some View {
+        AudioWaveformView(
+            audioURL: audioURL,
+            currentTime: playback.time,
+            duration: duration,
+            editActions: editActions,
+            loops: loops,
+            muteCutRanges: true
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .padding(.horizontal, 4)
     }
 }
 

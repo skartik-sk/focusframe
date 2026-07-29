@@ -64,9 +64,26 @@ private struct EditorMediaLoadResult: @unchecked Sendable {
 }
 
 @MainActor
+final class PlaybackClock: ObservableObject {
+    @Published var time: Double = 0
+}
+
+@MainActor
 class EditorVM: ObservableObject {
     @Published var project: RecordingProject
-    @Published var playheadTime: Double = 0
+
+    /// High-frequency playback position isolated on its own observable. `playheadTime`
+    /// remains the source of truth but is no longer @Published on this (fat) object, so
+    /// views that don't render the playhead — the inspector, toolbars, and the structural
+    /// timeline — are NOT invalidated ~24×/sec while a recording plays. Only views that
+    /// explicitly observe `playback` re-render per tick.
+    let playback = PlaybackClock()
+    var playheadTime: Double = 0 {
+        didSet {
+            guard playback.time != playheadTime else { return }
+            playback.time = playheadTime
+        }
+    }
     @Published var isPlaying = false
     @Published var zoomSegments: [ZoomSegment]
     @Published var editActions: [EditAction] = []
