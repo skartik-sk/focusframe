@@ -11,6 +11,7 @@ struct EditorInspectorView: View {
     @State private var finishSummary: ProductionFinishSummary?
     @State private var showSmartFeatureStatus = false
     @State private var recentBackgroundImages = BackgroundImageHistory.load()
+    @State private var collapsedSections: Set<String> = []
     @State private var isImportingSettings = false
     nonisolated private static let maxSettingsImportBytes: UInt64 = 2 * 1024 * 1024
 
@@ -67,7 +68,7 @@ struct EditorInspectorView: View {
 
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
+                    LazyVStack(alignment: .leading, spacing: 18) {
                         Picker("Inspector", selection: $inspectorMode) {
                             Text("Smart").tag(InspectorMode.smart)
                             Text("Advanced").tag(InspectorMode.advanced)
@@ -1222,24 +1223,46 @@ struct EditorInspectorView: View {
         _ title: String,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: sectionIcon(for: title))
-                    .foregroundColor(sectionTint(for: title))
-                    .frame(width: 18)
-                Text(title)
-                    .font(.subheadline.weight(.semibold))
+        let isCollapsed = collapsedSections.contains(title)
+        return VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    if isCollapsed {
+                        collapsedSections.remove(title)
+                    } else {
+                        collapsedSections.insert(title)
+                    }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: sectionIcon(for: title))
+                        .foregroundColor(sectionTint(for: title))
+                        .frame(width: 18)
+                    Text(title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundColor(.primary)
+                    Spacer()
+                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundColor(.secondary)
+                }
+                .contentShape(Rectangle())
             }
-            VStack(alignment: .leading, spacing: 10) {
-                content()
+            .buttonStyle(.plain)
+
+            if !isCollapsed {
+                VStack(alignment: .leading, spacing: 10) {
+                    content()
+                }
+                .padding(10)
+                .background(sectionTint(for: title).opacity(0.09))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(sectionTint(for: title).opacity(0.20), lineWidth: 1)
+                )
+                .transition(.opacity)
             }
-            .padding(10)
-            .background(sectionTint(for: title).opacity(0.09))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(sectionTint(for: title).opacity(0.20), lineWidth: 1)
-            )
         }
         .id(title)
     }
