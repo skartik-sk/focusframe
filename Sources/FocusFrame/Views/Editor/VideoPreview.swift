@@ -2,11 +2,17 @@ import SwiftUI
 import AppKit
 import CoreImage
 
+/// Displays the composited preview frame. The caller supplies a lazy `CIImage` graph
+/// (`onFrameRequest`); this view rasterizes it (`createCGImage`) on a background queue so
+/// the main thread — the playback timer and the rest of the UI — is never blocked by a
+/// Core Image render pass. If a render is still in flight when the next frame is
+/// requested, the request is coalesced to the latest time, so playback stays smooth and
+/// drops frames rather than stuttering when rendering can't keep up.
 struct VideoPreview: NSViewRepresentable {
     let time: Double
     let revision: Int
-    let onFrameRequest: @MainActor (Double) -> CVPixelBuffer?
-    
+    let onFrameRequest: @MainActor (Double) -> CIImage?
+
     func makeNSView(context: Context) -> NSImageView {
         let view = NSImageView()
         view.imageAlignment = .alignCenter
@@ -19,71 +25,80 @@ struct VideoPreview: NSViewRepresentable {
         view.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         return view
     }
-    
+
     func updateNSView(_ nsView: NSImageView, context: Context) {
         context.coordinator.onFrameRequest = onFrameRequest
-        context.coordinator.updateFrame(at: time, revision: revision, in: nsView)
+        context.coordinator.requestFrame(at: time, revision: revision, in: nsView)
     }
-    
+
     func makeCoordinator() -> Coordinator {
         Coordinator()
     }
-    
+
     @MainActor
     final class Coordinator {
         private let ciContext = CIContext(options: [.cacheIntermediates: false])
+        private let renderQueue = DispatchQueue(label: "focusframe.preview-render", qos: .userInitiated)
         private var lastRequestedTime = -Double.infinity
         private var lastRevision = -1
-        private var lastRenderWallTime = Date.distantPast
-        private let minimumRenderInterval: TimeInterval = 1.0 / 24.0
-        var onFrameRequest: (@MainActor (Double) -> CVPixelBuffer?)?
+        private var isRendering = false
+        private var pendingTime: Double?
+        private var pendingRevision: Int = 0
+        var onFrameRequest: (@MainActor (Double) -> CIImage?)?
 
-        func updateFrame(at time: Double, revision: Int, in imageView: NSImageView) {
+        func requestFrame(at time: Double, revision: Int, in imageView: NSImageView) {
             let needsRender = abs(time - lastRequestedTime) > 0.001 || revision != lastRevision || imageView.image == nil
             guard needsRender else { return }
 
-            let now = Date()
-            let revisionChanged = revision != lastRevision
-            if imageView.image != nil,
-               !revisionChanged,
-               now.timeIntervalSince(lastRenderWallTime) < minimumRenderInterval {
+            // Coalesce: remember the latest requested time while a render is in flight.
+            if isRendering {
+                pendingTime = time
+                pendingRevision = revision
                 return
             }
 
+            render(at: time, revision: revision, in: imageView)
+        }
+
+        private func render(at time: Double, revision: Int, in imageView: NSImageView) {
             lastRequestedTime = time
             lastRevision = revision
-            lastRenderWallTime = now
+            isRendering = true
 
-            autoreleasepool {
-                guard let frameBuffer = onFrameRequest?(time) else {
-                    if imageView.image == nil {
-                        imageView.image = nil
-                    }
-                    return
+            // Build the lazy CIImage graph on the main actor (it reads editor state), then
+            // rasterize it off-main.
+            guard let ciImage = onFrameRequest?(time) else {
+                isRendering = false
+                if imageView.image == nil {
+                    imageView.image = nil
                 }
+                return
+            }
 
-                let width = CVPixelBufferGetWidth(frameBuffer)
-                let height = CVPixelBufferGetHeight(frameBuffer)
-                guard width > 0, height > 0 else {
-                    if imageView.image == nil {
-                        imageView.image = nil
+            let context = ciContext
+            let extent = ciImage.extent
+            renderQueue.async { [weak imageView] in
+                let cgImage = extent.width > 0 && extent.height > 0
+                    ? context.createCGImage(ciImage, from: extent)
+                    : nil
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    if let cgImage, let imageView {
+                        imageView.image = NSImage(
+                            cgImage: cgImage,
+                            size: NSSize(width: cgImage.width, height: cgImage.height)
+                        )
                     }
-                    return
-                }
+                    self.isRendering = false
 
-                let frame = CIImage(cvPixelBuffer: frameBuffer)
-                let rect = CGRect(x: 0, y: 0, width: width, height: height)
-                guard let cgImage = ciContext.createCGImage(frame, from: rect) else {
-                    if imageView.image == nil {
-                        imageView.image = nil
+                    // Drain the coalesced request for the latest time, if any.
+                    if let nextTime = self.pendingTime {
+                        let nextRevision = self.pendingRevision
+                        self.pendingTime = nil
+                        guard let imageView else { return }
+                        self.render(at: nextTime, revision: nextRevision, in: imageView)
                     }
-                    return
                 }
-
-                imageView.image = NSImage(
-                    cgImage: cgImage,
-                    size: NSSize(width: width, height: height)
-                )
             }
         }
     }

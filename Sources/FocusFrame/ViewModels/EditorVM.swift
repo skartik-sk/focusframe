@@ -2146,21 +2146,33 @@ class EditorVM: ObservableObject {
     }
     
     // MARK: - Frame Rendering
-    
+
     func getFrame(at time: Double) -> CVPixelBuffer? {
+        guard let (inputs, config) = makeFrameInputs(at: time) else { return nil }
+        return renderer.renderFrame(inputs: inputs, config: config, outputSize: previewOutputSize)
+    }
+
+    /// The composited preview frame as a lazy `CIImage` graph (no rasterization). The
+    /// preview rasterizes this off the main thread (see VideoPreview), which keeps the
+    /// playback timer / UI responsive instead of blocking on a double Core Image render.
+    func previewFrameImage(at time: Double) -> CIImage? {
+        guard let (inputs, config) = makeFrameInputs(at: time) else { return nil }
+        return renderer.renderFrameImage(inputs: inputs, config: config, outputSize: previewOutputSize)
+    }
+
+    private func makeFrameInputs(at time: Double) -> (VideoRenderer.FrameInputs, StylePreset)? {
         guard let sourceFrame = loadSourceFrame(at: time) else { return nil }
-        
+
         let transform = frameTransform(at: time) ?? FrameTransform(
-                timestamp: 0,
-                transform: .identity,
-                sourceRect: .zero,
-                scale: 1.0,
-                isTransitioning: false,
-                transitionProgress: 0.0
-            )
+            timestamp: 0,
+            transform: .identity,
+            sourceRect: .zero,
+            scale: 1.0,
+            isTransitioning: false,
+            transitionProgress: 0.0
+        )
         let motionBlurVelocity = transformVelocity(at: time, current: transform)
-        
-        // Get cursor position for this time
+
         let cursorData = cursorFrame(at: time, frames: smoothedCursor)
         let cursorPosition = cursorData?.position
         let clickProgress = clickAnimationProgress(at: time, frames: smoothedCursor)
@@ -2172,31 +2184,27 @@ class EditorVM: ObservableObject {
             visibilityOverride: resolvedEffects.cursorVisibility
         )
         let config = previewStyleConfig(base: resolvedEffects.style)
-        
-        // Render frame
-        return renderer.renderFrame(
-            inputs: VideoRenderer.FrameInputs(
-                sourceFrame: sourceFrame,
-                timestamp: time,
-                zoomTransform: transform.transform,
-                cursorPosition: cursorPosition,
-                cursorVisible: cursorVisible,
-                cursorAlpha: 1.0,
-                cursorScale: config.cursorScale,
-                isClicking: cursorData?.isClicking ?? false,
-                clickAnimationProgress: clickProgress,
-                webcamFrame: resolvedEffects.webcamEnabled ? loadWebcamFrame(at: time) : nil,
-                activeShortcuts: resolvedEffects.showKeyboardShortcuts ? activeShortcuts(at: time, style: config) : [],
-                subtitleText: resolvedEffects.subtitlesEnabled ? activeSubtitle(at: time) : nil,
-                motionBlurVelocity: motionBlurVelocity,
-                activeOverlays: resolvedEffects.overlaysEnabled ? activeOverlays(at: time) : [],
-                activeTitleCards: activeTitleCards(at: time),
-                zoomScale: transform.scale,
-                cameraLayoutMode: activeCameraLayoutMode(at: time, webcamEnabled: resolvedEffects.webcamEnabled)
-            ),
-            config: config,
-            outputSize: previewOutputSize
+
+        let inputs = VideoRenderer.FrameInputs(
+            sourceFrame: sourceFrame,
+            timestamp: time,
+            zoomTransform: transform.transform,
+            cursorPosition: cursorPosition,
+            cursorVisible: cursorVisible,
+            cursorAlpha: 1.0,
+            cursorScale: config.cursorScale,
+            isClicking: cursorData?.isClicking ?? false,
+            clickAnimationProgress: clickProgress,
+            webcamFrame: resolvedEffects.webcamEnabled ? loadWebcamFrame(at: time) : nil,
+            activeShortcuts: resolvedEffects.showKeyboardShortcuts ? activeShortcuts(at: time, style: config) : [],
+            subtitleText: resolvedEffects.subtitlesEnabled ? activeSubtitle(at: time) : nil,
+            motionBlurVelocity: motionBlurVelocity,
+            activeOverlays: resolvedEffects.overlaysEnabled ? activeOverlays(at: time) : [],
+            activeTitleCards: activeTitleCards(at: time),
+            zoomScale: transform.scale,
+            cameraLayoutMode: activeCameraLayoutMode(at: time, webcamEnabled: resolvedEffects.webcamEnabled)
         )
+        return (inputs, config)
     }
 
     private func transformVelocity(at time: Double, current: FrameTransform) -> CGPoint {

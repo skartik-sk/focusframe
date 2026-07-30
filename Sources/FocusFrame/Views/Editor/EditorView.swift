@@ -692,7 +692,7 @@ private struct EditorVideoStage: View {
 
     var body: some View {
         VideoPreview(time: playback.time, revision: editorVM.renderRevision) { time in
-            editorVM.getFrame(at: time)
+            editorVM.previewFrameImage(at: time)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(18)
