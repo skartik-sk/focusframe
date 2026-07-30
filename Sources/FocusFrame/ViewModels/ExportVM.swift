@@ -4,6 +4,7 @@ import CoreImage
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
+import Metal
 
 final class ExportVM: ObservableObject, @unchecked Sendable {
     @Published var isExporting = false
@@ -11,6 +12,13 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
     @Published var selectedProfile: ExportProfile = .web1080p
     @Published var estimatedFileSize: String = ""
     @Published var outputURL: URL?
+    /// Live export telemetry surfaced to the UI (ETA, throughput, cores in use).
+    @Published var renderedFPS: Double = 0
+    @Published var estimatedTimeRemaining: Double = 0
+    @Published var coresInUse: Int = 0
+    /// Test/benchmark override for the parallel worker count. `nil` (default) uses one
+    /// worker per logical core — the production setting.
+    var workerCountOverride: Int?
     var project: RecordingProject?
     
     private let renderer = VideoRenderer()
@@ -24,7 +32,432 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
     private static let maxCaptionFileBytes: UInt64 = 10 * 1024 * 1024
     private static let maxKeyEventsFileBytes: UInt64 = 20 * 1024 * 1024
     private static let maxCursorDataFileBytes: UInt64 = 128 * 1024 * 1024
-    
+
+    // MARK: - Parallel render support
+
+    /// Read-only bundle of everything a worker needs to build one frame's inputs.
+    /// Shared by the video and GIF export paths. `bufferPool` is set for video
+    /// exports (writer-backed pool) and `nil` for GIF. `@unchecked Sendable`: holds
+    /// only immutable data (the pool, when present, is thread-safe for allocation).
+    private struct RenderContext: @unchecked Sendable {
+        let project: RecordingProject
+        let transforms: [FrameTransform]
+        let smoothedCursor: [CursorFrame]
+        let keyEvents: [KeyPressEvent]
+        let captionSegments: [CaptionSegment]
+        let timeline: [RenderTimelineSegment]
+        let sourceSize: CGSize
+        let width: Int
+        let height: Int
+        let fps: Int
+        let bufferPool: CVPixelBufferPool?
+    }
+
+    /// Per-worker rendering resources. `@unchecked Sendable`: a worker is used by at
+    /// most one task at a time (distinct offsets within a chunk; barriers between
+    /// chunks), so its renderer's mutable Core Image filter state is never accessed
+    /// concurrently.
+    private struct RenderWorker: @unchecked Sendable {
+        let renderer: VideoRenderer
+        let ciContext: CIContext
+        let webcamImageGenerator: AVAssetImageGenerator?
+    }
+
+    /// Ordered sink for the video writer. `@unchecked Sendable`: the pipeline calls
+    /// `append` strictly sequentially, so the writer objects are never touched
+    /// concurrently.
+    private final class WriterSink: @unchecked Sendable {
+        let videoInput: AVAssetWriterInput
+        let adaptor: AVAssetWriterInputPixelBufferAdaptor
+        let writer: AVAssetWriter
+        let fps: Int
+        let checkCancellation: @Sendable () throws -> Void
+
+        init(
+            videoInput: AVAssetWriterInput,
+            adaptor: AVAssetWriterInputPixelBufferAdaptor,
+            writer: AVAssetWriter,
+            fps: Int,
+            checkCancellation: @escaping @Sendable () throws -> Void
+        ) {
+            self.videoInput = videoInput
+            self.adaptor = adaptor
+            self.writer = writer
+            self.fps = fps
+            self.checkCancellation = checkCancellation
+        }
+
+        func append(_ buffer: CVPixelBuffer, frameIndex: Int) async throws {
+            while !videoInput.isReadyForMoreMediaData {
+                try checkCancellation()
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            let presentationTime = CMTime(value: CMTimeValue(frameIndex), timescale: CMTimeScale(fps))
+            guard adaptor.append(buffer, withPresentationTime: presentationTime) else {
+                throw writer.error ?? ExportError.renderingFailed
+            }
+        }
+    }
+
+    /// Ordered sink for the GIF destination. `@unchecked Sendable`: the pipeline
+    /// calls `add` strictly sequentially, so the destination is never touched
+    /// concurrently.
+    private final class GifSink: @unchecked Sendable {
+        let destination: CGImageDestination
+        let ciContext: CIContext
+        let outputSize: CGSize
+        let frameProperties: CFDictionary
+
+        init(
+            destination: CGImageDestination,
+            ciContext: CIContext,
+            outputSize: CGSize,
+            frameProperties: CFDictionary
+        ) {
+            self.destination = destination
+            self.ciContext = ciContext
+            self.outputSize = outputSize
+            self.frameProperties = frameProperties
+        }
+
+        func add(_ buffer: CVPixelBuffer) throws {
+            let ciImage = CIImage(cvPixelBuffer: buffer)
+            guard let cgImage = ciContext.createCGImage(
+                ciImage,
+                from: CGRect(origin: .zero, size: outputSize)
+            ) else {
+                throw ExportError.renderingFailed
+            }
+            CGImageDestinationAddImage(destination, cgImage, frameProperties)
+        }
+    }
+
+    /// Live export telemetry (frames completed + elapsed time) → progress, throughput,
+    /// and ETA. `@unchecked Sendable`: access is serialized through `lock`.
+    private final class ExportTelemetry: @unchecked Sendable {
+        private let lock = NSLock()
+        private var completed = 0
+        private let total: Int
+        private let start: Date
+
+        init(total: Int) {
+            self.total = total
+            self.start = Date()
+        }
+
+        func add(_ frames: Int) {
+            lock.lock()
+            completed += frames
+            lock.unlock()
+        }
+
+        var snapshot: (progress: Double, fps: Double, eta: Double) {
+            lock.lock()
+            let done = completed
+            let elapsed = Date().timeIntervalSince(start)
+            lock.unlock()
+            let progress = total > 0 ? min(1.0, Double(done) / Double(total)) : 0
+            let fps = elapsed > 0 ? Double(done) / elapsed : 0
+            let remaining = max(0, total - done)
+            let eta = fps > 0 ? Double(remaining) / fps : 0
+            return (progress, fps, eta)
+        }
+    }
+
+    private static func makeVideoRenderWorker(webcamAsset: AVAsset?) -> RenderWorker {
+        let webcamGenerator: AVAssetImageGenerator? = webcamAsset.map { asset in
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.requestedTimeToleranceAfter = CMTime(seconds: 0.03, preferredTimescale: 600)
+            generator.requestedTimeToleranceBefore = CMTime(seconds: 0.03, preferredTimescale: 600)
+            return generator
+        }
+
+        let metalDevice = MTLCreateSystemDefaultDevice()
+        let ciContext: CIContext
+        if let metalDevice {
+            ciContext = CIContext(mtlDevice: metalDevice, options: [.cacheIntermediates: false])
+        } else {
+            ciContext = CIContext(options: [.cacheIntermediates: false])
+        }
+
+        return RenderWorker(
+            renderer: VideoRenderer(),
+            ciContext: ciContext,
+            webcamImageGenerator: webcamGenerator
+        )
+    }
+
+    /// Streams hardware-decoded source frames from an asset via `AVAssetReader` — about
+    /// 34× faster than per-frame `AVAssetImageGenerator.copyCGImage` seeks, which was
+    /// the real export bottleneck. Advances in presentation order; `frame(at:)` returns
+    /// the source frame whose presentation covers the requested time.
+    /// `@unchecked Sendable`: accessed serially (only from the pipeline's serial decode
+    /// phase). Falls back to a generator seek if the reader cannot start or is exhausted.
+    private final class FrameSource: @unchecked Sendable {
+        private let reader: AVAssetReader?
+        private let output: AVAssetReaderTrackOutput?
+        private let fallback: AVAssetImageGenerator
+        private let lock = NSLock()
+        private var current: (CVPixelBuffer, CMTime)?
+        private var lookahead: (CVPixelBuffer, CMTime)?
+        private var started = false
+
+        init(asset: AVAsset, sourceSize: CGSize) async {
+            let fallback = AVAssetImageGenerator(asset: asset)
+            fallback.appliesPreferredTrackTransform = true
+            fallback.requestedTimeToleranceBefore = CMTime(seconds: 0.01, preferredTimescale: 600)
+            fallback.requestedTimeToleranceAfter = CMTime(seconds: 0.01, preferredTimescale: 600)
+            self.fallback = fallback
+
+            guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+                  let reader = try? AVAssetReader(asset: asset) else {
+                // No readable video track or reader could not be created: `frame(at:)`
+                // will fall back to the generator (or a gray frame), matching prior behavior.
+                self.reader = nil
+                self.output = nil
+                return
+            }
+            // CPU-backed BGRA output (no IOSurface/Metal compatibility). Hardware decode is
+            // still used, but frames land in independent, per-sample CPU buffers that are
+            // NOT pooled by the decoder — so a buffer retained in `current`/`lookahead`
+            // (and the lazy `CIImage` that references it, read later at render time) keeps
+            // its content. IOSurface-backed outputs are recycled by the decoder and produced
+            // frozen/stale frames in the export. CPU buffers also expose a base address.
+            let output = AVAssetReaderTrackOutput(
+                track: track,
+                outputSettings: [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                    kCVPixelBufferWidthKey as String: max(1, Int(sourceSize.width)),
+                    kCVPixelBufferHeightKey as String: max(1, Int(sourceSize.height))
+                ]
+            )
+            reader.add(output)
+            guard reader.startReading() else {
+                self.reader = nil
+                self.output = nil
+                return
+            }
+            self.reader = reader
+            self.output = output
+        }
+
+        private func readNext() -> (CVPixelBuffer, CMTime)? {
+            guard let output,
+                  let sample = output.copyNextSampleBuffer(),
+                  let buffer = CMSampleBufferGetImageBuffer(sample) else {
+                return nil
+            }
+            let presentationTime = CMSampleBufferGetPresentationTimeStamp(sample)
+            // AVAssetReader recycles a small pool of CVPixelBuffer *objects* across reads
+            // (confirmed: base addresses repeat in a cycle). The lazy `CIImage` returned by
+            // `frame(at:)` references that object, and by the time the parallel render reads
+            // it, the decoder has overwritten the backing with a later frame — producing
+            // frozen/advanced content with correct presentation timestamps (the export
+            // "frame drop"). Snapshot each frame into a fresh, private buffer object so the
+            // retained content is immutable. CPU-backed output makes the base-address copy
+            // viable. Falls back to the live buffer only if allocation/copy fails.
+            guard let copied = Self.deepCopyPixelBuffer(buffer) else {
+                return (buffer, presentationTime)
+            }
+            return (copied, presentationTime)
+        }
+
+        /// Allocates a fresh CVPixelBuffer and copies `source`'s current pixels into it.
+        /// The result is a private object whose backing is never recycled, so it stays
+        /// valid for as long as it is retained (unlike the reader's pooled buffers).
+        private static func deepCopyPixelBuffer(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+            let width = CVPixelBufferGetWidth(source)
+            let height = CVPixelBufferGetHeight(source)
+            let format = CVPixelBufferGetPixelFormatType(source)
+
+            var copy: CVPixelBuffer?
+            let status = CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                width,
+                height,
+                format,
+                nil,
+                &copy
+            )
+            guard status == kCVReturnSuccess, let copy else { return nil }
+
+            CVPixelBufferLockBaseAddress(source, [.readOnly])
+            CVPixelBufferLockBaseAddress(copy, [])
+            defer {
+                CVPixelBufferUnlockBaseAddress(copy, [])
+                CVPixelBufferUnlockBaseAddress(source, [.readOnly])
+            }
+
+            guard let sourceBase = CVPixelBufferGetBaseAddress(source),
+                  let copyBase = CVPixelBufferGetBaseAddress(copy) else {
+                return nil
+            }
+
+            let sourceBytesPerRow = CVPixelBufferGetBytesPerRow(source)
+            let copyBytesPerRow = CVPixelBufferGetBytesPerRow(copy)
+            if sourceBytesPerRow == copyBytesPerRow {
+                memcpy(copyBase, sourceBase, sourceBytesPerRow * height)
+            } else {
+                let rowBytes = min(sourceBytesPerRow, copyBytesPerRow)
+                for row in 0..<height {
+                    memcpy(
+                        copyBase.advanced(by: row * copyBytesPerRow),
+                        sourceBase.advanced(by: row * sourceBytesPerRow),
+                        rowBytes
+                    )
+                }
+            }
+            return copy
+        }
+
+        /// Returns the source frame whose presentation covers `time`.
+        func frame(at time: Double) -> CIImage {
+            lock.lock()
+            // Round to the nearest 1/600 tick instead of using
+            // `CMTime(seconds:preferredTimescale:)`, which TRUNCATES the seconds→tick
+            // conversion. `Double(frameIndex)/fps` is rarely exact, so e.g. 11/30·600 =
+            // 219.9999… truncates to 219 — one tick below frame 11's presentation time.
+            // That made `while next.pts <= target` fail to advance, so the previous frame
+            // was held and the target frame dropped (the export "frame drop"). Rounding
+            // recovers the exact grid time.
+            let target = CMTime(value: CMTimeValue((time * 600).rounded()), timescale: 600)
+
+            if reader?.status == .reading {
+                if !started {
+                    current = readNext()
+                    lookahead = readNext()
+                    started = true
+                }
+                while let next = lookahead, next.1 <= target {
+                    current = next
+                    lookahead = readNext()
+                }
+                if let cur = current {
+                    lock.unlock()
+                    return CIImage(cvPixelBuffer: cur.0)
+                }
+            }
+            lock.unlock()
+
+            if let cg = try? fallback.copyCGImage(at: target, actualTime: nil) {
+                return CIImage(cgImage: cg)
+            }
+            return CIImage(color: .init(cgColor: CGColor(gray: 0.2, alpha: 1.0)))
+        }
+    }
+
+    private func webcamAsset(for project: RecordingProject) -> AVAsset? {
+        guard let url = project.webcamFileURL,
+              FileManager.default.fileExists(atPath: url.path) else {
+            return nil
+        }
+        return AVAsset(url: url)
+    }
+
+    /// Builds the full `FrameInputs` for a frame from a pre-decoded source image and the
+    /// worker's webcam generator. Shared by the video and GIF paths so per-frame output
+    /// is identical across both.
+    private func frameInputs(
+        worker: RenderWorker,
+        frameIndex: Int,
+        sourceFrame: CIImage,
+        context: RenderContext
+    ) -> (inputs: VideoRenderer.FrameInputs, style: StylePreset) {
+        let outputTime = Double(frameIndex) / Double(context.fps)
+        let sourceTime = sourceTime(for: outputTime, timeline: context.timeline)
+        let frameTransform = frameTransform(at: sourceTime, transforms: context.transforms)
+        let motionBlurVelocity = transformVelocity(at: sourceTime, transforms: context.transforms)
+        let cursorData = cursorFrame(at: sourceTime, frames: context.smoothedCursor)
+        let clickProgress = clickAnimationProgress(at: sourceTime, frames: context.smoothedCursor)
+        let resolvedEffects = EffectSegmentResolver.resolve(project: context.project, at: sourceTime)
+        let style = resolvedEffects.style
+        let activeShortcuts = activeShortcuts(at: sourceTime, events: context.keyEvents, style: style)
+
+        let inputs = VideoRenderer.FrameInputs(
+            sourceFrame: sourceFrame,
+            timestamp: outputTime,
+            zoomTransform: frameTransform.transform,
+            cursorPosition: cursorData?.position,
+            cursorVisible: shouldShowCursor(
+                at: sourceTime,
+                cursorData: cursorData,
+                frames: context.smoothedCursor,
+                style: style,
+                project: context.project,
+                clickProgress: clickProgress,
+                visibilityOverride: resolvedEffects.cursorVisibility
+            ),
+            cursorAlpha: 1.0,
+            cursorScale: style.cursorScale,
+            isClicking: cursorData?.isClicking ?? false,
+            clickAnimationProgress: clickProgress,
+            webcamFrame: resolvedEffects.webcamEnabled ? loadWebcamFrame(at: sourceTime, generator: worker.webcamImageGenerator) : nil,
+            activeShortcuts: resolvedEffects.showKeyboardShortcuts ? activeShortcuts : [],
+            subtitleText: activeSubtitle(at: sourceTime, segments: context.captionSegments, enabled: resolvedEffects.subtitlesEnabled),
+            motionBlurVelocity: motionBlurVelocity,
+            activeOverlays: resolvedEffects.overlaysEnabled ? activeOverlays(at: sourceTime, project: context.project) : [],
+            activeTitleCards: activeTitleCards(at: sourceTime, project: context.project),
+            zoomScale: frameTransform.scale,
+            cameraLayoutMode: activeCameraLayoutMode(at: sourceTime, project: context.project, webcamEnabled: resolvedEffects.webcamEnabled)
+        )
+        return (inputs, style)
+    }
+
+    /// Renders a single video frame into a fresh pool-backed pixel buffer.
+    private func renderVideoFrame(
+        worker: RenderWorker,
+        frameIndex: Int,
+        sourceFrame: CIImage,
+        context: RenderContext
+    ) throws -> CVPixelBuffer {
+        guard let pool = context.bufferPool else { throw ExportError.renderingFailed }
+        let (inputs, style) = frameInputs(
+            worker: worker,
+            frameIndex: frameIndex,
+            sourceFrame: sourceFrame,
+            context: context
+        )
+
+        var pixelBuffer: CVPixelBuffer?
+        let createStatus = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
+        guard createStatus == kCVReturnSuccess, let pixelBuffer else {
+            throw ExportError.renderingFailed
+        }
+
+        worker.renderer.renderFrame(
+            inputs: inputs,
+            config: style,
+            outputSize: CGSize(width: context.width, height: context.height),
+            into: pixelBuffer
+        )
+        return pixelBuffer
+    }
+
+    /// Renders a single GIF frame into a freshly allocated pixel buffer (GIF has no
+    /// writer-backed pool). The caller converts it to a `CGImage` for the destination.
+    private func renderGifFrame(
+        worker: RenderWorker,
+        frameIndex: Int,
+        sourceFrame: CIImage,
+        context: RenderContext
+    ) throws -> CVPixelBuffer {
+        let (inputs, style) = frameInputs(
+            worker: worker,
+            frameIndex: frameIndex,
+            sourceFrame: sourceFrame,
+            context: context
+        )
+        guard let buffer = worker.renderer.renderFrame(
+            inputs: inputs,
+            config: style,
+            outputSize: CGSize(width: context.width, height: context.height)
+        ) else {
+            throw ExportError.renderingFailed
+        }
+        return buffer
+    }
+
     func export(project: RecordingProject, profile: ExportProfile) async throws -> URL {
         guard let finalURL = outputURL else {
             throw ExportError.noOutputLocation
@@ -73,11 +506,6 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
         let renderedDuration = timeline.last.map { $0.outputStart + $0.outputDuration } ?? sourceDuration
         guard renderedDuration.isFinite, renderedDuration > 0 else { throw ExportError.renderingFailed }
 
-        let imageGenerator = AVAssetImageGenerator(asset: sourceAsset)
-        imageGenerator.appliesPreferredTrackTransform = true
-        imageGenerator.requestedTimeToleranceAfter = CMTime(seconds: 0.01, preferredTimescale: 600)
-        imageGenerator.requestedTimeToleranceBefore = CMTime(seconds: 0.01, preferredTimescale: 600)
-
         try removeExistingFile(at: renderedVideoURL)
         let writer = try AVAssetWriter(outputURL: renderedVideoURL, fileType: fileType(for: profile))
 
@@ -123,99 +551,87 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
         )
         let smoothedCursor = loadSmoothedCursor(for: project, fps: Double(profile.fps))
         let keyEvents = loadKeyEvents(for: project)
-        let webcamGenerator = makeWebcamImageGenerator(for: project)
         let captionSegments = loadCaptionSegments(for: project)
 
-        for frameIndex in 0..<totalFrames {
-            try checkCancellation()
-            let outputTime = Double(frameIndex) / Double(profile.fps)
-            let sourceTime = sourceTime(for: outputTime, timeline: timeline)
-            let presentationTime = CMTime(value: CMTimeValue(frameIndex), timescale: CMTimeScale(profile.fps))
-            let pixelBuffer: CVPixelBuffer = try autoreleasepool {
-                let frameTransform = frameTransform(at: sourceTime, transforms: transforms)
-                let transform = frameTransform.transform
-                let motionBlurVelocity = transformVelocity(at: sourceTime, transforms: transforms)
-                let cursorData = cursorFrame(at: sourceTime, frames: smoothedCursor)
-                let clickProgress = clickAnimationProgress(at: sourceTime, frames: smoothedCursor)
-                let resolvedEffects = EffectSegmentResolver.resolve(project: project, at: sourceTime)
-                let style = resolvedEffects.style
-                let activeShortcuts = activeShortcuts(at: sourceTime, events: keyEvents, style: style)
-
-                let cmTime = CMTime(seconds: sourceTime, preferredTimescale: 600)
-                let sourceFrame: CIImage
-                do {
-                    let cgImage = try imageGenerator.copyCGImage(at: cmTime, actualTime: nil)
-                    sourceFrame = CIImage(cgImage: cgImage)
-                } catch {
-                    sourceFrame = CIImage(color: .init(cgColor: CGColor(gray: 0.2, alpha: 1.0)))
-                        .cropped(to: CGRect(origin: .zero, size: sourceSize))
-                }
-
-                guard let pool = pixelBufferAdaptor.pixelBufferPool else {
-                    throw ExportError.renderingFailed
-                }
-
-                var pixelBuffer: CVPixelBuffer?
-                let createStatus = CVPixelBufferPoolCreatePixelBuffer(
-                    kCFAllocatorDefault,
-                    pool,
-                    &pixelBuffer
-                )
-
-                guard createStatus == kCVReturnSuccess, let pixelBuffer else {
-                    throw ExportError.renderingFailed
-                }
-
-                renderer.renderFrame(
-                    inputs: VideoRenderer.FrameInputs(
-                        sourceFrame: sourceFrame,
-                        timestamp: outputTime,
-                        zoomTransform: transform,
-                        cursorPosition: cursorData?.position,
-                        cursorVisible: shouldShowCursor(
-                            at: sourceTime,
-                            cursorData: cursorData,
-                            frames: smoothedCursor,
-                            style: style,
-                            project: project,
-                            clickProgress: clickProgress,
-                            visibilityOverride: resolvedEffects.cursorVisibility
-                        ),
-                        cursorAlpha: 1.0,
-                        cursorScale: style.cursorScale,
-                        isClicking: cursorData?.isClicking ?? false,
-                        clickAnimationProgress: clickProgress,
-                        webcamFrame: resolvedEffects.webcamEnabled ? loadWebcamFrame(at: sourceTime, generator: webcamGenerator) : nil,
-                        activeShortcuts: resolvedEffects.showKeyboardShortcuts ? activeShortcuts : [],
-                        subtitleText: activeSubtitle(at: sourceTime, segments: captionSegments, enabled: resolvedEffects.subtitlesEnabled),
-                        motionBlurVelocity: motionBlurVelocity,
-                        activeOverlays: resolvedEffects.overlaysEnabled ? activeOverlays(at: sourceTime, project: project) : [],
-                        activeTitleCards: activeTitleCards(at: sourceTime, project: project),
-                        zoomScale: frameTransform.scale,
-                        cameraLayoutMode: activeCameraLayoutMode(at: sourceTime, project: project, webcamEnabled: resolvedEffects.webcamEnabled)
-                    ),
-                    config: style,
-                    outputSize: CGSize(width: profile.width, height: profile.height),
-                    into: pixelBuffer
-                )
-
-                return pixelBuffer
-            }
-
-            while !videoInput.isReadyForMoreMediaData {
-                try checkCancellation()
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
-
-            guard pixelBufferAdaptor.append(pixelBuffer, withPresentationTime: presentationTime) else {
-                throw writer.error ?? ExportError.renderingFailed
-            }
-
-            if frameIndex % max(1, profile.fps / 10) == 0 {
-                await setProgress(Double(frameIndex) / Double(totalFrames))
-                await Task.yield()
-            }
+        guard let pool = pixelBufferAdaptor.pixelBufferPool else {
+            throw ExportError.renderingFailed
         }
+
+        let context = RenderContext(
+            project: project,
+            transforms: transforms,
+            smoothedCursor: smoothedCursor,
+            keyEvents: keyEvents,
+            captionSegments: captionSegments,
+            timeline: timeline,
+            sourceSize: sourceSize,
+            width: profile.width,
+            height: profile.height,
+            fps: profile.fps,
+            bufferPool: pool
+        )
+
+        // One worker per logical core. Source frames are decoded once, serially, by a
+        // single AVAssetReader-backed FrameSource (~34× faster than per-frame
+        // copyCGImage); compositing runs in parallel across the workers.
+        let workerCount = max(1, workerCountOverride ?? ProcessInfo.processInfo.activeProcessorCount)
+        let frameSource = await FrameSource(asset: sourceAsset, sourceSize: sourceSize)
+        let telemetry = ExportTelemetry(total: totalFrames)
+        await MainActor.run { self.coresInUse = workerCount }
+
+        let checkCancel: @Sendable () throws -> Void = {
+            try self.checkCancellation()
+        }
+
+        let writerSink = WriterSink(
+            videoInput: videoInput,
+            adaptor: pixelBufferAdaptor,
+            writer: writer,
+            fps: profile.fps,
+            checkCancellation: checkCancel
+        )
+
+        let pipeline = ParallelFramePipeline<RenderWorker>(
+            workerCount: workerCount,
+            makeWorker: { [webcamURL = project.webcamFileURL] in
+                let webcamAsset = webcamURL.flatMap {
+                    FileManager.default.fileExists(atPath: $0.path) ? AVAsset(url: $0) : nil
+                }
+                return Self.makeVideoRenderWorker(webcamAsset: webcamAsset)
+            },
+            decode: { frameIndex in
+                let outputTime = Double(frameIndex) / Double(context.fps)
+                let sourceTime = self.sourceTime(for: outputTime, timeline: context.timeline)
+                return frameSource.frame(at: sourceTime)
+            },
+            render: { worker, frameIndex, sourceFrame in
+                try autoreleasepool {
+                    try self.renderVideoFrame(
+                        worker: worker,
+                        frameIndex: frameIndex,
+                        sourceFrame: sourceFrame,
+                        context: context
+                    )
+                }
+            },
+            sink: { frameIndex, buffer in
+                try await writerSink.append(buffer, frameIndex: frameIndex)
+            }
+        )
+
+        try await pipeline.run(
+            frameCount: totalFrames,
+            isCancelled: checkCancel,
+            onProgress: { framesCompleted in
+                telemetry.add(framesCompleted)
+                let snapshot = telemetry.snapshot
+                Task { @MainActor in
+                    self.progress = snapshot.progress
+                    self.renderedFPS = snapshot.fps
+                    self.estimatedTimeRemaining = snapshot.eta
+                }
+            }
+        )
 
         try checkCancellation()
         videoInput.markAsFinished()
@@ -254,11 +670,6 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
         let renderedDuration = timeline.last.map { $0.outputStart + $0.outputDuration } ?? sourceDuration
         guard renderedDuration.isFinite, renderedDuration > 0 else { throw ExportError.renderingFailed }
 
-        let imageGenerator = AVAssetImageGenerator(asset: sourceAsset)
-        imageGenerator.appliesPreferredTrackTransform = true
-        imageGenerator.requestedTimeToleranceAfter = CMTime(seconds: 0.03, preferredTimescale: 600)
-        imageGenerator.requestedTimeToleranceBefore = CMTime(seconds: 0.03, preferredTimescale: 600)
-
         let frameDuration = 1.0 / Double(profile.fps)
         let totalFrames = max(1, Int(ceil(renderedDuration * Double(profile.fps))))
         let outputSize = CGSize(width: profile.width, height: profile.height)
@@ -274,7 +685,6 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
         )
         let smoothedCursor = loadSmoothedCursor(for: project, fps: Double(profile.fps))
         let keyEvents = loadKeyEvents(for: project)
-        let webcamGenerator = makeWebcamImageGenerator(for: project)
         let captionSegments = loadCaptionSegments(for: project)
 
         guard let destination = CGImageDestinationCreateWithURL(outputURL as CFURL, UTType.gif.identifier as CFString, totalFrames, nil) else {
@@ -294,75 +704,77 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
             ]
         ]
 
-        for i in 0..<totalFrames {
-            try checkCancellation()
-            try autoreleasepool {
-                let outputSeconds = Double(i) * frameDuration
-                let sourceSeconds = sourceTime(for: outputSeconds, timeline: timeline)
-                let time = CMTime(seconds: sourceSeconds, preferredTimescale: 600)
-                let sourceFrame: CIImage
-                if let cgImage = try? imageGenerator.copyCGImage(at: time, actualTime: nil) {
-                    sourceFrame = CIImage(cgImage: cgImage)
-                } else {
-                    sourceFrame = CIImage(color: .init(cgColor: CGColor(gray: 0.2, alpha: 1.0)))
-                        .cropped(to: CGRect(origin: .zero, size: sourceSize))
-                }
+        let context = RenderContext(
+            project: project,
+            transforms: transforms,
+            smoothedCursor: smoothedCursor,
+            keyEvents: keyEvents,
+            captionSegments: captionSegments,
+            timeline: timeline,
+            sourceSize: sourceSize,
+            width: profile.width,
+            height: profile.height,
+            fps: profile.fps,
+            bufferPool: nil
+        )
 
-                let frameTransform = frameTransform(at: sourceSeconds, transforms: transforms)
-                let transform = frameTransform.transform
-                let motionBlurVelocity = transformVelocity(at: sourceSeconds, transforms: transforms)
-                let cursorData = cursorFrame(at: sourceSeconds, frames: smoothedCursor)
-                let clickProgress = clickAnimationProgress(at: sourceSeconds, frames: smoothedCursor)
-                let resolvedEffects = EffectSegmentResolver.resolve(project: project, at: sourceSeconds)
-                let style = resolvedEffects.style
-                let activeShortcuts = activeShortcuts(at: sourceSeconds, events: keyEvents, style: style)
+        let workerCount = max(1, workerCountOverride ?? ProcessInfo.processInfo.activeProcessorCount)
+        let frameSource = await FrameSource(asset: sourceAsset, sourceSize: sourceSize)
+        let telemetry = ExportTelemetry(total: totalFrames)
+        await MainActor.run { self.coresInUse = workerCount }
 
-                guard let renderedPB = renderer.renderFrame(
-                    inputs: VideoRenderer.FrameInputs(
-                        sourceFrame: sourceFrame,
-                        timestamp: outputSeconds,
-                        zoomTransform: transform,
-                        cursorPosition: cursorData?.position,
-                        cursorVisible: shouldShowCursor(
-                            at: sourceSeconds,
-                            cursorData: cursorData,
-                            frames: smoothedCursor,
-                            style: style,
-                            project: project,
-                            clickProgress: clickProgress,
-                            visibilityOverride: resolvedEffects.cursorVisibility
-                        ),
-                        cursorAlpha: 1.0,
-                        cursorScale: style.cursorScale,
-                        isClicking: cursorData?.isClicking ?? false,
-                        clickAnimationProgress: clickProgress,
-                        webcamFrame: resolvedEffects.webcamEnabled ? loadWebcamFrame(at: sourceSeconds, generator: webcamGenerator) : nil,
-                        activeShortcuts: resolvedEffects.showKeyboardShortcuts ? activeShortcuts : [],
-                        subtitleText: activeSubtitle(at: sourceSeconds, segments: captionSegments, enabled: resolvedEffects.subtitlesEnabled),
-                        motionBlurVelocity: motionBlurVelocity,
-                        activeOverlays: resolvedEffects.overlaysEnabled ? activeOverlays(at: sourceSeconds, project: project) : [],
-                        activeTitleCards: activeTitleCards(at: sourceSeconds, project: project),
-                        zoomScale: frameTransform.scale,
-                        cameraLayoutMode: activeCameraLayoutMode(at: sourceSeconds, project: project, webcamEnabled: resolvedEffects.webcamEnabled)
-                    ),
-                    config: style,
-                    outputSize: outputSize
-                ) else {
-                    throw ExportError.renderingFailed
-                }
+        let gifSink = GifSink(
+            destination: destination,
+            ciContext: ciContext,
+            outputSize: outputSize,
+            frameProperties: frameProperties as CFDictionary
+        )
 
-                let ciImage = CIImage(cvPixelBuffer: renderedPB)
-                guard let cgImage = ciContext.createCGImage(ciImage, from: CGRect(origin: .zero, size: outputSize)) else {
-                    throw ExportError.renderingFailed
-                }
-
-                CGImageDestinationAddImage(destination, cgImage, frameProperties as CFDictionary)
-            }
-            if i % max(1, profile.fps / 10) == 0 {
-                await setProgress(Double(i) / Double(totalFrames) * 0.8)
-                await Task.yield()
-            }
+        let checkCancel: @Sendable () throws -> Void = {
+            try self.checkCancellation()
         }
+
+        let pipeline = ParallelFramePipeline<RenderWorker>(
+            workerCount: workerCount,
+            makeWorker: { [webcamURL = project.webcamFileURL] in
+                let webcamAsset = webcamURL.flatMap {
+                    FileManager.default.fileExists(atPath: $0.path) ? AVAsset(url: $0) : nil
+                }
+                return Self.makeVideoRenderWorker(webcamAsset: webcamAsset)
+            },
+            decode: { frameIndex in
+                let outputTime = Double(frameIndex) / Double(context.fps)
+                let sourceTime = self.sourceTime(for: outputTime, timeline: context.timeline)
+                return frameSource.frame(at: sourceTime)
+            },
+            render: { worker, frameIndex, sourceFrame in
+                try autoreleasepool {
+                    try self.renderGifFrame(
+                        worker: worker,
+                        frameIndex: frameIndex,
+                        sourceFrame: sourceFrame,
+                        context: context
+                    )
+                }
+            },
+            sink: { _, buffer in
+                try gifSink.add(buffer)
+            }
+        )
+
+        try await pipeline.run(
+            frameCount: totalFrames,
+            isCancelled: checkCancel,
+            onProgress: { framesCompleted in
+                telemetry.add(framesCompleted)
+                let snapshot = telemetry.snapshot
+                Task { @MainActor in
+                    self.progress = snapshot.progress * 0.8
+                    self.renderedFPS = snapshot.fps
+                    self.estimatedTimeRemaining = snapshot.eta
+                }
+            }
+        )
 
         guard CGImageDestinationFinalize(destination) else {
             throw ExportError.renderingFailed
@@ -371,34 +783,6 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
         await setProgress(1.0)
         completed = true
         return outputURL
-    }
-    
-    private func createSampleBuffer(from pixelBuffer: CVPixelBuffer, at time: Double, fps: Int) -> CMSampleBuffer? {
-        var formatDescription: CMFormatDescription?
-        CMVideoFormatDescriptionCreateForImageBuffer(
-            allocator: kCFAllocatorDefault,
-            imageBuffer: pixelBuffer,
-            formatDescriptionOut: &formatDescription
-        )
-        
-        guard let formatDesc = formatDescription else { return nil }
-        
-        var sampleBuffer: CMSampleBuffer?
-        var timing = CMSampleTimingInfo(
-            duration: CMTime(value: 1, timescale: CMTimeScale(fps)),
-            presentationTimeStamp: CMTime(seconds: time, preferredTimescale: 600),
-            decodeTimeStamp: CMTime.invalid
-        )
-        
-        let status = CMSampleBufferCreateReadyWithImageBuffer(
-            allocator: kCFAllocatorDefault,
-            imageBuffer: pixelBuffer,
-            formatDescription: formatDesc,
-            sampleTiming: &timing,
-            sampleBufferOut: &sampleBuffer
-        )
-        
-        return status == noErr ? sampleBuffer : nil
     }
 
     private func normalizedSourceSize(for project: RecordingProject) -> CGSize {
@@ -544,20 +928,6 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
             return transforms[match]
         }
         return transforms[0]
-    }
-
-    private func makeWebcamImageGenerator(for project: RecordingProject) -> AVAssetImageGenerator? {
-        guard let webcamURL = project.webcamFileURL,
-              FileManager.default.fileExists(atPath: webcamURL.path) else {
-            return nil
-        }
-
-        let asset = AVAsset(url: webcamURL)
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        generator.requestedTimeToleranceAfter = CMTime(seconds: 0.03, preferredTimescale: 600)
-        generator.requestedTimeToleranceBefore = CMTime(seconds: 0.03, preferredTimescale: 600)
-        return generator
     }
 
     private func loadWebcamFrame(at time: Double, generator: AVAssetImageGenerator?) -> CIImage? {

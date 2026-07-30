@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 private enum TimelineScrollTarget {
     static let playhead = "timeline-playhead-scroll-target"
@@ -21,13 +22,17 @@ enum TimelinePreferences {
     }
 }
 
+// MARK: - Orchestrator
+
 struct TimelineView: View {
     @ObservedObject var editorVM: EditorVM
     let compact: Bool
+
     @State private var isDragging = false
     @State private var dragAnchorTime: Double?
     @State private var optionDeleteMode = false
     @State private var shiftExtendMode = false
+    @State private var snapDisabled = false
     @State private var localFlagsMonitor: Any?
     @State private var globalFlagsMonitor: Any?
     @State private var resizeStartHeight: Double?
@@ -38,7 +43,13 @@ struct TimelineView: View {
         self.editorVM = editorVM
         self.compact = compact
     }
-    
+
+    private let gutterWidth: CGFloat = 112
+    private let rulerHeight: CGFloat = 30
+    private let filmstripHeight: CGFloat = 64
+    private let slimLaneHeight: CGFloat = 38
+    private let audioLaneHeight: CGFloat = 46
+
     var body: some View {
         VStack(spacing: 0) {
             if !compact {
@@ -47,12 +58,48 @@ struct TimelineView: View {
 
             GeometryReader { geometry in
                 ScrollViewReader { scrollProxy in
-                    let contentWidth = max(geometry.size.width, geometry.size.width * CGFloat(clampedTimelineZoomScale))
-                    ScrollView([.horizontal, .vertical]) {
-                        timelineContent(width: contentWidth)
-                            .frame(width: contentWidth, height: timelineHeight)
+                    let bodyWidth = max(0, geometry.size.width - gutterWidth)
+                    let contentWidth = max(bodyWidth, bodyWidth * CGFloat(clampedTimelineZoomScale))
+                    let specs = laneSpecs
+                    let contentHeight = specs.reduce(CGFloat(0)) { $0 + $1.height }
+
+                    ScrollView(.vertical, showsIndicators: false) {
+                        HStack(spacing: 0) {
+                            // Fixed left gutter — pinned horizontally, scrolls vertically with content.
+                            VStack(spacing: 0) {
+                                ForEach(specs) { spec in
+                                    TimelineGutterRow(spec: spec)
+                                }
+                            }
+                            .frame(width: gutterWidth)
+                            .background(Color(nsColor: .windowBackgroundColor))
+
+                            // Scrolling body — one lane per spec, single shared playhead.
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                ZStack(alignment: .topLeading) {
+                                    VStack(spacing: 0) {
+                                        ForEach(specs) { spec in
+                                            spec.bodyContent
+                                                .frame(width: contentWidth, height: spec.height)
+                                        }
+                                    }
+
+                                    // Only this overlay observes the per-tick playback
+                                    // clock; the lanes above stay still while playing.
+                                    TimelinePlayheadOverlay(
+                                        playback: editorVM.playback,
+                                        duration: editorVM.duration,
+                                        totalHeight: contentHeight,
+                                        rulerHeight: rulerHeight,
+                                        selectedRangeStart: editorVM.selectedRangeStart,
+                                        selectedRangeEnd: editorVM.selectedRangeEnd,
+                                        width: contentWidth
+                                    )
+                                }
+                                .frame(width: contentWidth, height: contentHeight)
+                            }
+                        }
                     }
-                    .background(Color(nsColor: .controlBackgroundColor))
                     .onChange(of: timelineZoomScale) { _ in
                         centerTimelineOnPlayhead(using: scrollProxy)
                     }
@@ -65,19 +112,519 @@ struct TimelineView: View {
             }
         }
         .frame(height: timelineViewportHeight)
-        .onAppear {
-            startModifierMonitoring()
-        }
+        .onAppear(perform: startModifierMonitoring)
         .onDisappear(perform: stopModifierMonitoring)
     }
+
+    // MARK: - Lane specs (gutter + body stay aligned because both render from this)
+
+    private var laneSpecs: [TimelineLaneSpec] {
+        var specs: [TimelineLaneSpec] = []
+
+        // Ruler
+        specs.append(TimelineLaneSpec(
+            id: "ruler",
+            height: rulerHeight,
+            gutterTitle: "",
+            bodyContent: AnyView(
+                TimelineRulerBody(duration: editorVM.duration, onChange: handleScrubChanged, onEnd: handleScrubEnded)
+            )
+        ))
+
+        // Video group
+        specs.append(TimelineLaneSpec(
+            id: "video",
+            height: filmstripHeight,
+            gutterTitle: "Video",
+            gutterIcon: "film",
+            gutterTrailing: filmstripTrailingText,
+            addControl: videoAddMenu,
+            bodyContent: AnyView(
+                VideoTimelineLane(
+                    editorVM: editorVM,
+                    duration: editorVM.duration,
+                    height: filmstripHeight,
+                    showsDeleteControls: optionDeleteMode,
+                    extendsWithShift: shiftExtendMode,
+                    snapEnabled: snapEnabled,
+                    videoURL: editorVM.project.videoFileURL
+                )
+            ),
+            groupAccent: .blue
+        ))
+
+        if !editorVM.titleCards.isEmpty {
+            specs.append(titleCardLaneSpec())
+        }
+        if !editorVM.overlays.isEmpty {
+            specs.append(overlayLaneSpec())
+        }
+        if editorVM.selectedTool == .effects || !editorVM.effectSegments.isEmpty {
+            specs.append(effectSegmentLaneSpec())
+        }
+        if editorVM.project.webcamFileURL != nil {
+            specs.append(cameraLayoutLaneSpec())
+        }
+
+        // Edits group
+        specs.append(TimelineLaneSpec(
+            id: "edits",
+            height: slimLaneHeight,
+            gutterTitle: "Edits",
+            gutterIcon: "scissors",
+            bodyContent: AnyView(
+                ClipLane(
+                    duration: editorVM.duration,
+                    height: slimLaneHeight,
+                    playhead: editorVM.playheadTime,
+                    showsDeleteControls: optionDeleteMode,
+                    extendsWithShift: shiftExtendMode,
+                    snapEnabled: snapEnabled,
+                    clips: editActionDescriptors,
+                    background: Color(nsColor: .underPageBackgroundColor)
+                )
+            ),
+            groupAccent: .orange
+        ))
+
+        if editorVM.hasKeyboardEvents {
+            specs.append(TimelineLaneSpec(
+                id: "keys",
+                height: slimLaneHeight,
+                gutterTitle: "Keys",
+                gutterIcon: "keyboard",
+                bodyContent: AnyView(
+                    KeysTimelineLane(
+                        editorVM: editorVM,
+                        duration: editorVM.duration,
+                        height: slimLaneHeight,
+                        showsDeleteControls: optionDeleteMode
+                    )
+                ),
+                groupAccent: .orange
+            ))
+        }
+
+        // Audio group
+        specs.append(audioLaneSpec(
+            id: "audio-main",
+            title: mainAudioTrackTitle,
+            icon: "waveform",
+            url: editorVM.project.systemAudioFileURL ?? editorVM.project.videoFileURL,
+            loops: false,
+            trailing: mainAudioTrailingText
+        ))
+        if let micURL = editorVM.project.micAudioFileURL {
+            specs.append(audioLaneSpec(
+                id: "audio-mic",
+                title: "Mic",
+                icon: "mic",
+                url: micURL,
+                loops: false,
+                trailing: audioEditSummary
+            ))
+        }
+        if editorVM.project.style.backgroundMusicURL != nil {
+            specs.append(audioLaneSpec(
+                id: "audio-music",
+                title: "Music",
+                icon: "music.note",
+                url: editorVM.project.style.backgroundMusicURL,
+                loops: editorVM.project.style.backgroundMusicLoop,
+                trailing: musicTrailingText
+            ))
+        }
+
+        return specs
+    }
+
+    // MARK: - Lane builders
+
+    private func titleCardLaneSpec() -> TimelineLaneSpec {
+        let menu = AnyView(Menu {
+            ForEach(TitleCardKind.allCases) { kind in
+                Button(kind.label) { editorVM.addTitleCard(kind: kind, at: editorVM.playheadTime) }
+            }
+        } label: {
+            Image(systemName: "plus.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .frame(width: 24, height: 24))
+
+        return TimelineLaneSpec(
+            id: "title-cards",
+            height: slimLaneHeight,
+            gutterTitle: "Title",
+            gutterIcon: "text.rectangle",
+            addControl: menu,
+            bodyContent: AnyView(
+                ClipLane(
+                    duration: editorVM.duration,
+                    height: slimLaneHeight,
+                    playhead: editorVM.playheadTime,
+                    showsDeleteControls: optionDeleteMode,
+                    extendsWithShift: shiftExtendMode,
+                    snapEnabled: snapEnabled,
+                    clips: titleCardDescriptors,
+                    background: Color(nsColor: .underPageBackgroundColor)
+                )
+            ),
+            groupAccent: .blue
+        )
+    }
+
+    private func overlayLaneSpec() -> TimelineLaneSpec {
+        let menu = AnyView(Menu {
+            ForEach(OverlayType.allCases, id: \.self) { type in
+                Button(type.label) { editorVM.addOverlay(type: type, at: editorVM.playheadTime) }
+            }
+        } label: {
+            Image(systemName: "plus.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .frame(width: 24, height: 24))
+
+        return TimelineLaneSpec(
+            id: "overlays",
+            height: slimLaneHeight,
+            gutterTitle: "Overlays",
+            gutterIcon: "rectangle.on.rectangle",
+            addControl: menu,
+            bodyContent: AnyView(
+                ClipLane(
+                    duration: editorVM.duration,
+                    height: slimLaneHeight,
+                    playhead: editorVM.playheadTime,
+                    showsDeleteControls: optionDeleteMode,
+                    extendsWithShift: shiftExtendMode,
+                    snapEnabled: snapEnabled,
+                    clips: overlayDescriptors,
+                    background: Color(nsColor: .underPageBackgroundColor)
+                )
+            ),
+            groupAccent: .blue
+        )
+    }
+
+    private func effectSegmentLaneSpec() -> TimelineLaneSpec {
+        let menu = AnyView(Menu {
+            ForEach(EffectSegmentPreset.allCases) { preset in
+                Button(preset.title) {
+                    _ = editorVM.addEffectSegment(
+                        startTime: editorVM.playheadTime,
+                        endTime: min(editorVM.duration, editorVM.playheadTime + 5),
+                        preset: preset
+                    )
+                }
+            }
+        } label: {
+            Image(systemName: "plus.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .frame(width: 24, height: 24))
+
+        return TimelineLaneSpec(
+            id: "effect-segments",
+            height: slimLaneHeight,
+            gutterTitle: "Effects",
+            gutterIcon: "slider.horizontal.3",
+            addControl: menu,
+            bodyContent: AnyView(
+                ClipLane(
+                    duration: editorVM.duration,
+                    height: slimLaneHeight,
+                    playhead: editorVM.playheadTime,
+                    showsDeleteControls: optionDeleteMode,
+                    extendsWithShift: shiftExtendMode,
+                    snapEnabled: snapEnabled,
+                    clips: effectSegmentDescriptors,
+                    background: Color(nsColor: .underPageBackgroundColor)
+                )
+            ),
+            groupAccent: .blue
+        )
+    }
+
+    private func cameraLayoutLaneSpec() -> TimelineLaneSpec {
+        let menu = AnyView(Menu {
+            ForEach(CameraLayoutMode.allCases) { mode in
+                Button(mode.label) { editorVM.addCameraLayout(mode: mode) }
+            }
+        } label: {
+            Image(systemName: "plus.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .frame(width: 24, height: 24))
+
+        return TimelineLaneSpec(
+            id: "camera-layouts",
+            height: slimLaneHeight,
+            gutterTitle: "Camera",
+            gutterIcon: "rectangle.split.2x1",
+            addControl: menu,
+            bodyContent: AnyView(
+                ClipLane(
+                    duration: editorVM.duration,
+                    height: slimLaneHeight,
+                    playhead: editorVM.playheadTime,
+                    showsDeleteControls: optionDeleteMode,
+                    extendsWithShift: shiftExtendMode,
+                    snapEnabled: snapEnabled,
+                    clips: cameraLayoutDescriptors,
+                    background: Color(nsColor: .underPageBackgroundColor)
+                )
+            ),
+            groupAccent: .blue
+        )
+    }
+
+    private func audioLaneSpec(id: String, title: String, icon: String, url: URL?, loops: Bool, trailing: String?) -> TimelineLaneSpec {
+        TimelineLaneSpec(
+            id: id,
+            height: audioLaneHeight,
+            gutterTitle: title,
+            gutterIcon: icon,
+            gutterTrailing: trailing,
+            bodyContent: AnyView(
+                PlaybackWaveformLane(
+                    playback: editorVM.playback,
+                    audioURL: url,
+                    duration: max(editorVM.duration, 0.001),
+                    editActions: editorVM.project.editActions,
+                    loops: loops
+                )
+            ),
+            groupAccent: .teal
+        )
+    }
+
+    private var videoAddMenu: AnyView {
+        AnyView(Menu {
+            Menu("Add Title Card") {
+                ForEach(TitleCardKind.allCases) { kind in
+                    Button(kind.label) { editorVM.addTitleCard(kind: kind, at: editorVM.playheadTime) }
+                }
+            }
+            Menu("Add Overlay") {
+                ForEach(OverlayType.allCases, id: \.self) { type in
+                    Button(type.label) { editorVM.addOverlay(type: type, at: editorVM.playheadTime) }
+                }
+            }
+            Menu("Add Effect Segment") {
+                ForEach(EffectSegmentPreset.allCases) { preset in
+                    Button(preset.title) {
+                        _ = editorVM.addEffectSegment(
+                            startTime: editorVM.playheadTime,
+                            endTime: min(editorVM.duration, editorVM.playheadTime + 5),
+                            preset: preset
+                        )
+                    }
+                }
+            }
+            Divider()
+            Button("Add Zoom at Playhead") { editorVM.addZoomSegment(at: editorVM.playheadTime) }
+        } label: {
+            Image(systemName: "plus.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .frame(width: 24, height: 24))
+    }
+
+    // MARK: - Clip descriptors
+
+    private var editActionDescriptors: [ClipDescriptor] {
+        editorVM.editActions.map { action in
+            let kind: TimelineClipKind
+            let label: String
+            switch action.type {
+            case .cut:
+                kind = .cut
+                label = "Cut"
+            case .speedChange:
+                kind = .speed
+                label = action.value.map { String(format: "%.1fx", $0) } ?? "Speed"
+            case .hideCursor:
+                kind = .hideCursor
+                label = "Hide"
+            }
+            return ClipDescriptor(
+                id: action.id,
+                kind: kind,
+                label: label,
+                startTime: action.startTime,
+                endTime: action.endTime,
+                isSelected: editorVM.selectedTimelineItem == .editAction(action.id),
+                minimumDuration: 0.2,
+                onSelect: {
+                    editorVM.selectEditAction(action.id)
+                    editorVM.seek(to: action.startTime)
+                },
+                onBeginEdit: { editorVM.beginInteractiveEdit() },
+                onUpdate: { start, end in
+                    editorVM.updateEditActionTiming(action.id, startTime: start, endTime: end)
+                },
+                onEndEdit: { editorVM.endInteractiveEdit() },
+                onRemove: { editorVM.removeEditAction(action.id) }
+            )
+        }
+    }
+
+    private var titleCardDescriptors: [ClipDescriptor] {
+        editorVM.titleCards.map { card in
+            let trimmed = card.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            return ClipDescriptor(
+                id: card.id,
+                kind: .title,
+                label: trimmed.isEmpty ? card.kind.label : trimmed,
+                startTime: card.startTime,
+                endTime: card.endTime,
+                isSelected: editorVM.selectedTimelineItem == .titleCard(card.id),
+                minimumDuration: 0.4,
+                onSelect: {
+                    editorVM.selectTitleCard(card.id)
+                    editorVM.seek(to: card.startTime)
+                },
+                onBeginEdit: { editorVM.beginInteractiveEdit() },
+                onUpdate: { start, end in
+                    var updated = card
+                    updated.startTime = start
+                    updated.endTime = end
+                    editorVM.updateTitleCard(updated)
+                },
+                onEndEdit: { editorVM.endInteractiveEdit() },
+                onRemove: { editorVM.removeTitleCard(card.id) }
+            )
+        }
+    }
+
+    private var overlayDescriptors: [ClipDescriptor] {
+        editorVM.overlays.map { overlay in
+            let label: String
+            if overlay.type == .text {
+                let trimmed = overlay.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                label = trimmed.isEmpty ? overlay.type.label : trimmed
+            } else {
+                label = overlay.type.label
+            }
+            return ClipDescriptor(
+                id: overlay.id,
+                kind: .overlay,
+                label: label,
+                startTime: overlay.startTime,
+                endTime: overlay.endTime,
+                isSelected: editorVM.selectedTimelineItem == .overlay(overlay.id),
+                minimumDuration: 0.2,
+                onSelect: {
+                    editorVM.selectOverlay(overlay.id)
+                    editorVM.seek(to: overlay.startTime)
+                },
+                onBeginEdit: { editorVM.beginInteractiveEdit() },
+                onUpdate: { start, end in
+                    var updated = overlay
+                    updated.startTime = start
+                    updated.endTime = end
+                    editorVM.updateOverlay(updated)
+                },
+                onEndEdit: { editorVM.endInteractiveEdit() },
+                onRemove: { editorVM.removeOverlay(overlay.id) }
+            )
+        }
+    }
+
+    private var effectSegmentDescriptors: [ClipDescriptor] {
+        editorVM.effectSegments.map { segment in
+            ClipDescriptor(
+                id: segment.id,
+                kind: .effect,
+                label: segment.name,
+                startTime: segment.startTime,
+                endTime: segment.endTime,
+                isSelected: editorVM.selectedTimelineItem == .effectSegment(segment.id),
+                minimumDuration: 0.4,
+                onSelect: {
+                    editorVM.selectEffectSegment(segment.id)
+                    editorVM.selectedTool = .effects
+                    editorVM.seek(to: segment.startTime)
+                },
+                onBeginEdit: { editorVM.beginInteractiveEdit() },
+                onUpdate: { start, end in
+                    var updated = segment
+                    updated.startTime = start
+                    updated.endTime = end
+                    editorVM.updateEffectSegment(updated)
+                },
+                onEndEdit: { editorVM.endInteractiveEdit() },
+                onRemove: { editorVM.removeEffectSegment(segment.id) }
+            )
+        }
+    }
+
+    private var cameraLayoutDescriptors: [ClipDescriptor] {
+        editorVM.cameraLayouts.map { layout in
+            ClipDescriptor(
+                id: layout.id,
+                kind: .camera,
+                label: layout.mode.label,
+                startTime: layout.startTime,
+                endTime: layout.endTime,
+                isSelected: editorVM.selectedTimelineItem == .cameraLayout(layout.id),
+                minimumDuration: 0.4,
+                onSelect: {
+                    editorVM.selectCameraLayout(layout.id)
+                    editorVM.seek(to: layout.startTime)
+                },
+                onBeginEdit: { editorVM.beginInteractiveEdit() },
+                onUpdate: { start, end in
+                    var updated = layout
+                    updated.startTime = start
+                    updated.endTime = end
+                    editorVM.updateCameraLayout(updated)
+                },
+                onEndEdit: { editorVM.endInteractiveEdit() },
+                onRemove: { editorVM.removeCameraLayout(layout.id) }
+            )
+        }
+    }
+
+    // MARK: - Scrub (ruler)
+
+    private func handleScrubChanged(x: CGFloat, width: CGFloat) {
+        guard !editorVM.isTimelineItemInteractionActive else { return }
+        let fraction = max(0, min(1, x / max(width, 1)))
+        let time = fraction * safeDuration
+        if !isDragging {
+            dragAnchorTime = time
+            editorVM.selectedRangeStart = time
+            editorVM.selectedRangeEnd = time
+        }
+        isDragging = true
+        editorVM.seek(to: time)
+        editorVM.selectedRangeEnd = time
+    }
+
+    private func handleScrubEnded(x: CGFloat, width: CGFloat) {
+        defer {
+            isDragging = false
+            dragAnchorTime = nil
+        }
+        guard !editorVM.isTimelineItemInteractionActive else { return }
+        if let anchor = dragAnchorTime {
+            editorVM.selectedRangeStart = anchor
+            editorVM.selectedRangeEnd = editorVM.playheadTime
+        }
+    }
+
+    // Playhead + selection-band overlays live in TimelinePlayheadOverlay (the only
+    // timeline subview that observes the per-tick playback clock).
+
+    // MARK: - Controls bar
 
     private var timelineControls: some View {
         HStack(spacing: 8) {
             Button {
                 timelineZoomScale = max(1, clampedTimelineZoomScale / 1.25)
             } label: {
-                Image(systemName: "minus.magnifyingglass")
-                    .frame(width: 18)
+                Image(systemName: "minus.magnifyingglass").frame(width: 18)
             }
             .buttonStyle(.borderless)
             .help("Zoom timeline out")
@@ -89,14 +636,13 @@ struct TimelineView: View {
                 ),
                 in: 1...8
             )
-            .frame(width: 150)
+            .frame(width: 140)
             .help("Timeline zoom")
 
             Button {
                 timelineZoomScale = min(8, clampedTimelineZoomScale * 1.25)
             } label: {
-                Image(systemName: "plus.magnifyingglass")
-                    .frame(width: 18)
+                Image(systemName: "plus.magnifyingglass").frame(width: 18)
             }
             .buttonStyle(.borderless)
             .help("Zoom timeline in")
@@ -116,37 +662,40 @@ struct TimelineView: View {
 
             Spacer()
 
-            if shiftExtendMode {
-                Label("Extend", systemImage: "arrow.left.and.right")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundColor(.accentColor)
-            } else if optionDeleteMode {
-                Label("Delete", systemImage: "xmark.circle")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundColor(.red)
-            } else {
-                Text("Shift-drag extends. Option shows delete.")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-            }
+            modifierHint
         }
         .padding(.horizontal, 8)
-        .frame(height: 34)
+        .frame(height: 32)
         .background(Color(nsColor: .controlBackgroundColor))
-        .overlay(alignment: .top) {
-            Divider()
+        .overlay(alignment: .top) { Divider() }
+    }
+
+    @ViewBuilder
+    private var modifierHint: some View {
+        if shiftExtendMode {
+            Label("Extend", systemImage: "arrow.left.and.right")
+                .font(.caption2.weight(.semibold))
+                .foregroundColor(.accentColor)
+        } else if optionDeleteMode {
+            Label("Delete", systemImage: "xmark.circle")
+                .font(.caption2.weight(.semibold))
+                .foregroundColor(.red)
+        } else if snapDisabled {
+            Label("Snap off", systemImage: "magnet.slash")
+                .font(.caption2.weight(.semibold))
+                .foregroundColor(.secondary)
+        } else {
+            Text("Drag clips · Shift extends · ⌥ deletes · ⌃ disables snap")
+                .font(.caption2)
+                .foregroundColor(.secondary)
         }
     }
 
     private var timelineResizeDivider: some View {
         HStack(spacing: 8) {
-            Rectangle()
-                .fill(Color.secondary.opacity(0.16))
-                .frame(height: 1)
+            Rectangle().fill(Color.secondary.opacity(0.16)).frame(height: 1)
             ResizeTimelineHeightHandle()
-            Rectangle()
-                .fill(Color.secondary.opacity(0.16))
-                .frame(height: 1)
+            Rectangle().fill(Color.secondary.opacity(0.16)).frame(height: 1)
         }
         .padding(.horizontal, 10)
         .frame(height: 14)
@@ -156,201 +705,18 @@ struct TimelineView: View {
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
-    @ViewBuilder
-    private func timelineContent(width: CGFloat) -> some View {
-        ZStack(alignment: .leading) {
-            VStack(spacing: 0) {
-                TimelineRuler(
-                    duration: editorVM.duration,
-                    currentTime: $editorVM.playheadTime
-                )
-                .contentShape(Rectangle())
-                .gesture(selectionGesture(width: width))
+    // MARK: - Derived layout values
 
-                if !editorVM.titleCards.isEmpty {
-                    TitleCardTimelineTrackView(
-                        editorVM: editorVM,
-                        currentTime: editorVM.playheadTime,
-                        showsDeleteControls: optionDeleteMode,
-                        extendsWithShift: shiftExtendMode
-                    )
-                }
+    private var safeDuration: Double { max(editorVM.duration, 0.001) }
 
-                ZoomTrackView(
-                    editorVM: editorVM,
-                    currentTime: editorVM.playheadTime,
-                    showsDeleteControls: optionDeleteMode,
-                    extendsWithShift: shiftExtendMode
-                )
-
-                EditRegionsTrackView(
-                    editorVM: editorVM,
-                    currentTime: editorVM.playheadTime,
-                    showsDeleteControls: optionDeleteMode,
-                    extendsWithShift: shiftExtendMode
-                )
-
-                if editorVM.selectedTool == .effects || !editorVM.effectSegments.isEmpty {
-                    EffectSegmentsTimelineTrackView(
-                        editorVM: editorVM,
-                        currentTime: editorVM.playheadTime,
-                        showsDeleteControls: optionDeleteMode,
-                        extendsWithShift: shiftExtendMode
-                    )
-                }
-
-                if !editorVM.overlays.isEmpty {
-                    OverlayTimelineTrackView(
-                        editorVM: editorVM,
-                        currentTime: editorVM.playheadTime,
-                        showsDeleteControls: optionDeleteMode,
-                        extendsWithShift: shiftExtendMode
-                    )
-                }
-
-                if editorVM.hasKeyboardEvents {
-                    ShortcutTimelineTrackView(
-                        editorVM: editorVM,
-                        currentTime: editorVM.playheadTime,
-                        showsDeleteControls: optionDeleteMode
-                    )
-                }
-
-                if editorVM.project.webcamFileURL != nil {
-                    CameraLayoutTimelineTrackView(
-                        editorVM: editorVM,
-                        currentTime: editorVM.playheadTime,
-                        showsDeleteControls: optionDeleteMode,
-                        extendsWithShift: shiftExtendMode
-                    )
-                }
-
-                AudioTimelineTrackView(
-                    title: mainAudioTrackTitle,
-                    systemImage: "waveform",
-                    audioURL: editorVM.project.systemAudioFileURL ?? editorVM.project.videoFileURL,
-                    currentTime: editorVM.playheadTime,
-                    duration: editorVM.duration,
-                    editActions: editorVM.project.editActions,
-                    loops: false,
-                    trailingText: mainAudioTrailingText
-                )
-
-                if let micAudioURL = editorVM.project.micAudioFileURL {
-                    AudioTimelineTrackView(
-                        title: "Mic",
-                        systemImage: "mic",
-                        audioURL: micAudioURL,
-                        currentTime: editorVM.playheadTime,
-                        duration: editorVM.duration,
-                        editActions: editorVM.project.editActions,
-                        loops: false,
-                        trailingText: audioEditSummary
-                    )
-                }
-
-                if editorVM.project.style.backgroundMusicURL != nil {
-                    AudioTimelineTrackView(
-                        title: "Music",
-                        systemImage: "music.note",
-                        audioURL: editorVM.project.style.backgroundMusicURL,
-                        currentTime: editorVM.playheadTime,
-                        duration: editorVM.duration,
-                        editActions: editorVM.project.editActions,
-                        loops: editorVM.project.style.backgroundMusicLoop,
-                        trailingText: musicTrailingText
-                    )
-                }
-            }
-
-            Rectangle()
-                .fill(Color.clear)
-                .frame(width: 1, height: timelineHeight)
-                .position(x: playheadX(width: width), y: timelineHeight / 2)
-                .id(TimelineScrollTarget.playhead)
-                .allowsHitTesting(false)
-
-            if let range = selectedRangeBand(width: width) {
-                Rectangle()
-                    .fill(Color.red.opacity(0.12))
-                    .overlay(
-                        Rectangle()
-                            .stroke(Color.red.opacity(0.45), lineWidth: 1)
-                    )
-                    .frame(width: range.width, height: timelineHeight)
-                    .position(x: range.midX, y: timelineHeight / 2)
-                    .allowsHitTesting(false)
-            }
-        }
-    }
-
-    private var safeDuration: Double {
-        max(editorVM.duration, 0.001)
-    }
-
-    private func playheadX(width: CGFloat) -> CGFloat {
-        CGFloat(max(0, min(1, editorVM.playheadTime / safeDuration))) * width
-    }
-
-    private func selectionGesture(width: CGFloat) -> some Gesture {
-        DragGesture(minimumDistance: 0)
-            .onChanged { value in
-                guard !editorVM.isTimelineItemInteractionActive else { return }
-                let clampedX = max(0, min(width, value.location.x))
-                let fraction = max(0, min(1, clampedX / max(width, 1)))
-                let newTime = fraction * safeDuration
-
-                if !isDragging {
-                    dragAnchorTime = newTime
-                    editorVM.selectedRangeStart = newTime
-                    editorVM.selectedRangeEnd = newTime
-                }
-
-                isDragging = true
-                editorVM.seek(to: newTime)
-                editorVM.selectedRangeEnd = newTime
-            }
-            .onEnded { _ in
-                defer {
-                    isDragging = false
-                    dragAnchorTime = nil
-                }
-                guard !editorVM.isTimelineItemInteractionActive else { return }
-                if let dragAnchorTime {
-                    editorVM.selectedRangeStart = dragAnchorTime
-                    editorVM.selectedRangeEnd = editorVM.playheadTime
-                }
-            }
-    }
+    private var snapEnabled: Bool { !snapDisabled }
 
     private var timelineHeight: CGFloat {
-        var height: CGFloat = compact ? 190 : 226
-        if !editorVM.titleCards.isEmpty {
-            height += 42
-        }
-        if editorVM.hasKeyboardEvents {
-            height += 42
-        }
-        if !editorVM.overlays.isEmpty {
-            height += 42
-        }
-        if editorVM.selectedTool == .effects || !editorVM.effectSegments.isEmpty {
-            height += 42
-        }
-        if editorVM.project.webcamFileURL != nil {
-            height += 42
-        }
-        if editorVM.project.micAudioFileURL != nil {
-            height += 56
-        }
-        if editorVM.project.style.backgroundMusicURL != nil {
-            height += 56
-        }
-        return height
+        laneSpecs.reduce(0) { $0 + $1.height }
     }
 
     private var timelineViewportHeight: CGFloat {
-        timelineScrollHeight + (compact ? 0 : 48)
+        timelineScrollHeight + (compact ? 0 : 44)
     }
 
     private var timelineScrollHeight: CGFloat {
@@ -366,6 +732,11 @@ struct TimelineView: View {
 
     private var clampedExpandedTimelineHeight: Double {
         TimelinePreferences.sanitizedExpandedHeight(expandedTimelineHeight)
+    }
+
+    private var filmstripTrailingText: String? {
+        let zoomCount = editorVM.zoomSegments.count
+        return zoomCount == 0 ? nil : "\(zoomCount) zoom\(zoomCount == 1 ? "" : "s")"
     }
 
     private var timelineHeightResizeGesture: some Gesture {
@@ -391,21 +762,19 @@ struct TimelineView: View {
         }
     }
 
+    // MARK: - Modifier key monitoring
+
     private func startModifierMonitoring() {
         updateModifierModes()
         if localFlagsMonitor == nil {
             localFlagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { event in
-                optionDeleteMode = event.modifierFlags.contains(.option)
-                shiftExtendMode = event.modifierFlags.contains(.shift)
+                applyModifierFlags(event.modifierFlags)
                 return event
             }
         }
         if globalFlagsMonitor == nil {
             globalFlagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { event in
-                Task { @MainActor in
-                    optionDeleteMode = event.modifierFlags.contains(.option)
-                    shiftExtendMode = event.modifierFlags.contains(.shift)
-                }
+                Task { @MainActor in self.applyModifierFlags(event.modifierFlags) }
             }
         }
     }
@@ -421,24 +790,21 @@ struct TimelineView: View {
         }
         optionDeleteMode = false
         shiftExtendMode = false
+        snapDisabled = false
     }
 
     private func updateModifierModes() {
-        optionDeleteMode = NSEvent.modifierFlags.contains(.option)
-        shiftExtendMode = NSEvent.modifierFlags.contains(.shift)
+        applyModifierFlags(NSEvent.modifierFlags)
     }
 
-    private func selectedRangeBand(width: CGFloat) -> CGRect? {
-        guard let start = editorVM.selectedRangeStart,
-              let end = editorVM.selectedRangeEnd,
-              abs(end - start) >= 0.05 else {
-            return nil
-        }
-
-        let left = min(start, end) / safeDuration * width
-        let bandWidth = max(2, abs(end - start) / safeDuration * width)
-        return CGRect(x: left, y: 0, width: bandWidth, height: timelineHeight)
+    @MainActor
+    private func applyModifierFlags(_ flags: NSEvent.ModifierFlags) {
+        optionDeleteMode = flags.contains(.option)
+        shiftExtendMode = flags.contains(.shift)
+        snapDisabled = flags.contains(.control)
     }
+
+    // MARK: - Audio summary helpers
 
     private var audioEditSummary: String? {
         let cuts = editorVM.project.editActions.filter { $0.type == .cut }.count
@@ -465,16 +831,11 @@ struct TimelineView: View {
         } else {
             systemAudioText = nil
         }
-
         switch (systemAudioText, audioEditSummary) {
-        case let (status?, edits?):
-            return "\(status) / \(edits)"
-        case let (status?, nil):
-            return status
-        case let (nil, edits?):
-            return edits
-        case (nil, nil):
-            return nil
+        case let (status?, edits?): return "\(status) / \(edits)"
+        case let (status?, nil): return status
+        case let (nil, edits?): return edits
+        case (nil, nil): return nil
         }
     }
 
@@ -491,283 +852,377 @@ struct TimelineView: View {
     }
 }
 
-struct TitleCardTimelineTrackView: View {
-    @ObservedObject var editorVM: EditorVM
-    let currentTime: Double
-    let showsDeleteControls: Bool
-    let extendsWithShift: Bool
+// MARK: - Clip descriptor
 
-    var body: some View {
-        GeometryReader { geometry in
-            ZStack(alignment: .leading) {
-                Rectangle()
-                    .fill(Color(nsColor: .underPageBackgroundColor))
-
-                HStack(spacing: 6) {
-                    Label("Cards", systemImage: "sparkles.tv")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Menu {
-                        ForEach(TitleCardKind.allCases) { kind in
-                            Button(kind.label) {
-                                editorVM.addTitleCard(kind: kind, at: editorVM.playheadTime)
-                            }
-                        }
-                    } label: {
-                        Image(systemName: "plus.circle")
-                    }
-                    .menuStyle(.borderlessButton)
-                    .frame(width: 28, height: 28)
-                }
-                .padding(.horizontal, 8)
-
-                ForEach(editorVM.titleCards) { card in
-                    TitleCardTimelineBlock(
-                        card: card,
-                        isSelected: editorVM.selectedTimelineItem == .titleCard(card.id),
-                        duration: editorVM.duration,
-                        totalWidth: geometry.size.width,
-                        height: geometry.size.height,
-                        showsDeleteControls: showsDeleteControls,
-                        extendsWithShift: extendsWithShift,
-                        onSelect: {
-                            editorVM.selectTitleCard(card.id)
-                            editorVM.seek(to: card.startTime)
-                        },
-                        onBeginEdit: {
-                            editorVM.beginInteractiveEdit()
-                        },
-                        onUpdate: editorVM.updateTitleCard,
-                        onEndEdit: {
-                            editorVM.endInteractiveEdit()
-                        },
-                        onRemove: {
-                            editorVM.removeTitleCard(card.id)
-                        }
-                    )
-                }
-
-                Rectangle()
-                    .fill(Color.accentColor.opacity(0.8))
-                    .frame(width: 2)
-                    .position(
-                        x: (currentTime / max(editorVM.duration, 0.001)) * geometry.size.width,
-                        y: geometry.size.height / 2
-                    )
-            }
-        }
-        .frame(height: 36)
-    }
-}
-
-private struct TitleCardTimelineBlock: View {
-    let card: TitleCardSegment
+/// A ranged clip projected from any track model into the unified rendering/gesture
+/// pipeline. Carries closures bound to the originating model so the generic
+/// `TimelineClipView` never needs to know the concrete segment type.
+struct ClipDescriptor: Identifiable {
+    let id: UUID
+    let kind: TimelineClipKind
+    let label: String
+    let startTime: Double
+    let endTime: Double
     let isSelected: Bool
-    let duration: Double
-    let totalWidth: CGFloat
-    let height: CGFloat
-    let showsDeleteControls: Bool
-    let extendsWithShift: Bool
+    let minimumDuration: Double
     let onSelect: () -> Void
     let onBeginEdit: () -> Void
-    let onUpdate: (TitleCardSegment) -> Void
+    let onUpdate: (Double, Double) -> Void
     let onEndEdit: () -> Void
     let onRemove: () -> Void
 
-    @State private var dragStart: Double?
-    @State private var dragEnd: Double?
-
-    var body: some View {
-        let startX = (card.startTime / max(duration, 0.001)) * totalWidth
-        let width = max((max(0.1, card.endTime - card.startTime) / max(duration, 0.001)) * totalWidth, 34)
-
-        ZStack(alignment: .topTrailing) {
-            Label(card.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? card.kind.label : card.title, systemImage: "text.rectangle")
-                .font(.caption2.weight(.semibold))
-                .lineLimit(1)
-                .labelStyle(.titleAndIcon)
-                .padding(.horizontal, 8)
-                .frame(width: width, height: 24)
-                .background(
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(Color.orange.opacity(0.26))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 5)
-                                .stroke(isSelected ? Color.orange : Color.clear, lineWidth: 2)
-                        )
-                )
-                .foregroundColor(.orange)
-            HStack(spacing: 0) {
-                ResizeHandle(color: .orange)
-                    .highPriorityGesture(resizeGesture(edge: .leading))
-                Spacer(minLength: 0)
-                ResizeHandle(color: .orange)
-                    .highPriorityGesture(resizeGesture(edge: .trailing))
-            }
-            .frame(width: width, height: 24)
-            if showsDeleteControls {
-                TimelineDeleteButton(action: onRemove)
-                    .offset(x: 7, y: -7)
-            }
-        }
-            .position(x: startX + width / 2, y: height / 2)
-            .simultaneousGesture(TapGesture().onEnded(onSelect))
-            .highPriorityGesture(moveGesture)
-            .contextMenu {
-                ForEach(TitleCardStyle.allCases) { style in
-                    Button(style.label) {
-                        var updated = card
-                        updated.style = style
-                        onUpdate(updated)
-                    }
-                }
-                Divider()
-                Button("Remove", role: .destructive, action: onRemove)
-            }
-    }
-
-    private var moveGesture: some Gesture {
-        DragGesture()
-            .onChanged { value in
-                initializeDragState()
-                let delta = Double(value.translation.width / max(totalWidth, 1)) * duration
-                guard let dragStart, let dragEnd else { return }
-                var updated = card
-                if extendsWithShift {
-                    if delta >= 0 {
-                        updated.startTime = dragStart
-                        updated.endTime = min(duration, dragEnd + delta)
-                    } else {
-                        updated.startTime = max(0, dragStart + delta)
-                        updated.endTime = dragEnd
-                    }
-                } else {
-                    let length = max(0.4, dragEnd - dragStart)
-                    updated.startTime = max(0, min(duration - length, dragStart + delta))
-                    updated.endTime = updated.startTime + length
-                }
-                onUpdate(updated)
-            }
-            .onEnded { _ in
-                dragStart = nil
-                dragEnd = nil
-                onEndEdit()
-            }
-    }
-
-    private func resizeGesture(edge: ResizeEdge) -> some Gesture {
-        DragGesture()
-            .onChanged { value in
-                initializeDragState()
-                let delta = Double(value.translation.width / max(totalWidth, 1)) * duration
-                guard let dragStart, let dragEnd else { return }
-                var updated = card
-                switch edge {
-                case .leading:
-                    updated.startTime = dragStart + delta
-                    updated.endTime = dragEnd
-                case .trailing:
-                    updated.startTime = dragStart
-                    updated.endTime = dragEnd + delta
-                }
-                onUpdate(updated)
-            }
-            .onEnded { _ in
-                dragStart = nil
-                dragEnd = nil
-                onEndEdit()
-            }
-    }
-
-    private func initializeDragState() {
-        if dragStart == nil {
-            onBeginEdit()
-            dragStart = card.startTime
-            dragEnd = card.endTime
-        }
+    @MainActor
+    func makeView(
+        duration: Double,
+        totalWidth: CGFloat,
+        laneHeight: CGFloat,
+        showsDeleteControls: Bool,
+        extendsWithShift: Bool,
+        snapCandidates: [Double],
+        snapThresholdSeconds: Double,
+        snapEnabled: Bool,
+        dragFeedback: TimelineDragFeedback
+    ) -> TimelineClipView {
+        TimelineClipView(
+            kind: kind,
+            label: label,
+            startTime: startTime,
+            endTime: endTime,
+            isSelected: isSelected,
+            duration: duration,
+            totalWidth: totalWidth,
+            laneHeight: laneHeight,
+            minimumDuration: minimumDuration,
+            showsDeleteControls: showsDeleteControls,
+            extendsWithShift: extendsWithShift,
+            snapCandidates: snapCandidates,
+            snapThresholdSeconds: snapThresholdSeconds,
+            snapEnabled: snapEnabled,
+            onSelect: onSelect,
+            onBeginEdit: onBeginEdit,
+            onUpdate: onUpdate,
+            onEndEdit: onEndEdit,
+            onRemove: onRemove,
+            dragFeedback: dragFeedback
+        )
     }
 }
 
-struct ShortcutTimelineTrackView: View {
-    @ObservedObject var editorVM: EditorVM
-    let currentTime: Double
-    let showsDeleteControls: Bool
+// MARK: - Playhead overlay (the only timeline view that re-renders per playback tick)
+
+/// Renders the single global playhead (line + head) and the drag-selection band. This is
+/// the only part of the timeline that observes the high-frequency `PlaybackClock`, so the
+/// filmstrip, clips, gutter, and ruler stay completely still while a recording plays.
+struct TimelinePlayheadOverlay: View {
+    @ObservedObject var playback: PlaybackClock
+    let duration: Double
+    let totalHeight: CGFloat
+    let rulerHeight: CGFloat
+    let selectedRangeStart: Double?
+    let selectedRangeEnd: Double?
+    let width: CGFloat
 
     var body: some View {
-        GeometryReader { geometry in
-            let visibleEvents = TimelineEventSampler.sampleKeyEvents(
-                editorVM.recordedKeyEvents,
-                duration: editorVM.duration,
-                width: geometry.size.width
-            )
-            let hiddenCount = max(0, editorVM.recordedKeyEvents.count - visibleEvents.count)
-            ZStack(alignment: .leading) {
-                Rectangle()
-                    .fill(Color(nsColor: .underPageBackgroundColor))
-
-                HStack(spacing: 6) {
-                    Label("Keys", systemImage: "keyboard")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    if hiddenCount > 0 {
-                        Text("+\(hiddenCount)")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundColor(.secondary)
-                            .help("Dense key events are sampled in the timeline. Preview and export still use all recorded keys.")
-                    }
-                }
-                .padding(.horizontal, 8)
+        let x = playheadX
+        ZStack(alignment: .topLeading) {
+            // Scroll anchor (invisible).
+            Rectangle()
+                .fill(Color.clear)
+                .frame(width: 1, height: totalHeight)
+                .position(x: x, y: totalHeight / 2)
+                .id(TimelineScrollTarget.playhead)
                 .allowsHitTesting(false)
 
-                ForEach(visibleEvents) { event in
-                    let x = (event.timestamp / max(editorVM.duration, 0.001)) * geometry.size.width
-                    ShortcutEventBlock(
-                        event: event,
-                        isSelected: editorVM.selectedTimelineItem == .keyEvent(event.id),
-                        showsDeleteControls: showsDeleteControls,
-                        onSelect: {
-                            editorVM.removeKeyEvent(event.id)
-                        },
-                        onRemove: {
-                            editorVM.removeKeyEvent(event.id)
-                        }
-                    )
-                        .position(x: max(28, min(geometry.size.width - 28, x)), y: geometry.size.height / 2)
-                        .contextMenu {
-                            Button("Hide this key") {
-                                editorVM.removeKeyEvent(event.id)
-                            }
-                            Button("Hide all \(event.displayString)") {
-                                _ = editorVM.removeKeyEvents(matching: event.displayString)
-                            }
-                        }
-                }
+            Rectangle()
+                .fill(Color.accentColor)
+                .frame(width: 1.5)
+                .frame(height: totalHeight)
+                .position(x: x, y: totalHeight / 2)
+                .allowsHitTesting(false)
 
+            Circle()
+                .fill(Color.accentColor)
+                .frame(width: 11, height: 11)
+                .overlay(Circle().fill(Color.white).frame(width: 3.5, height: 3.5))
+                .shadow(color: .black.opacity(0.3), radius: 1.5, y: 1)
+                .position(x: x, y: rulerHeight / 2)
+                .allowsHitTesting(false)
+
+            if let band = selectionBandRect {
                 Rectangle()
-                    .fill(Color.accentColor.opacity(0.8))
-                    .frame(width: 2)
-                    .position(
-                        x: (currentTime / max(editorVM.duration, 0.001)) * geometry.size.width,
-                        y: geometry.size.height / 2
+                    .fill(Color.accentColor.opacity(0.12))
+                    .overlay(
+                        Rectangle()
+                            .stroke(Color.accentColor.opacity(0.45), lineWidth: 1)
                     )
+                    .frame(width: band.width, height: totalHeight)
+                    .position(x: band.midX, y: totalHeight / 2)
+                    .allowsHitTesting(false)
             }
         }
-        .frame(height: 36)
+    }
+
+    private var playheadX: CGFloat {
+        CGFloat(max(0, min(1, playback.time / max(duration, 0.001)))) * width
+    }
+
+    private var selectionBandRect: CGRect? {
+        guard let start = selectedRangeStart,
+              let end = selectedRangeEnd,
+              abs(end - start) >= 0.05 else {
+            return nil
+        }
+        let safe = max(duration, 0.001)
+        let left = min(start, end) / safe * width
+        let bandWidth = max(2, abs(end - start) / safe * width)
+        return CGRect(x: left, y: 0, width: bandWidth, height: totalHeight)
     }
 }
 
-private struct ShortcutEventBlock: View {
-    let event: KeyPressEvent
-    let isSelected: Bool
+/// Audio waveform lane that tracks the playhead. Observes `PlaybackClock` so its
+/// played-region colour advances during playback without re-rendering the rest of the
+/// timeline.
+struct PlaybackWaveformLane: View {
+    @ObservedObject var playback: PlaybackClock
+    let audioURL: URL?
+    let duration: Double
+    let editActions: [EditAction]
+    let loops: Bool
+
+    var body: some View {
+        AudioWaveformView(
+            audioURL: audioURL,
+            currentTime: playback.time,
+            duration: duration,
+            editActions: editActions,
+            loops: loops,
+            muteCutRanges: true
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .padding(.horizontal, 4)
+    }
+}
+
+// MARK: - Snap math
+
+enum TimelineSnapMath {
+    static func candidates(playhead: Double, duration: Double, width: CGFloat, clips: [ClipDescriptor]) -> [Double] {
+        var values: [Double] = [playhead]
+        values.append(contentsOf: TimelineTickPlanner.ticks(duration: duration, width: width).map(Double.init))
+        for clip in clips {
+            values.append(clip.startTime)
+            values.append(clip.endTime)
+        }
+        return values
+    }
+
+    static func threshold(duration: Double, width: CGFloat) -> Double {
+        let pixelsPerSecond = width / max(duration, 0.001)
+        return min(0.5, 10.0 / max(pixelsPerSecond, 1))
+    }
+}
+
+// MARK: - Generic clip lane
+
+/// A lane that renders any set of ranged clips against a plain background, with a
+/// shared snap guide. Used by title / overlay / effect / camera / edits lanes.
+struct ClipLane: View {
+    let duration: Double
+    let height: CGFloat
+    let playhead: Double
     let showsDeleteControls: Bool
-    let onSelect: () -> Void
+    let extendsWithShift: Bool
+    let snapEnabled: Bool
+    let clips: [ClipDescriptor]
+    let background: Color
+
+    @StateObject private var dragFeedback = TimelineDragFeedback()
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = geo.size.width
+            let candidates = TimelineSnapMath.candidates(playhead: playhead, duration: duration, width: width, clips: clips)
+            let threshold = TimelineSnapMath.threshold(duration: duration, width: width)
+
+            ZStack(alignment: .topLeading) {
+                background
+
+                ForEach(clips) { descriptor in
+                    descriptor.makeView(
+                        duration: duration,
+                        totalWidth: width,
+                        laneHeight: height,
+                        showsDeleteControls: showsDeleteControls,
+                        extendsWithShift: extendsWithShift,
+                        snapCandidates: candidates,
+                        snapThresholdSeconds: threshold,
+                        snapEnabled: snapEnabled,
+                        dragFeedback: dragFeedback
+                    )
+                }
+
+                snapGuide(width: width)
+            }
+        }
+        .frame(height: height)
+    }
+
+    @ViewBuilder
+    private func snapGuide(width: CGFloat) -> some View {
+        if let time = dragFeedback.snapGuideTime {
+            let x = CGFloat(time / max(duration, 0.001)) * width
+            Rectangle()
+                .fill(Color.white.opacity(0.55))
+                .frame(width: 1)
+                .frame(height: height)
+                .position(x: x, y: height / 2)
+                .allowsHitTesting(false)
+        }
+    }
+}
+
+// MARK: - Video (filmstrip) lane
+
+/// The hero lane: real video frames with zoom clips floating on top. Tapping an empty
+/// area adds a zoom segment at that time (preserving the prior ZoomTrackView affordance).
+struct VideoTimelineLane: View {
+    @ObservedObject var editorVM: EditorVM
+    let duration: Double
+    let height: CGFloat
+    let showsDeleteControls: Bool
+    let extendsWithShift: Bool
+    let snapEnabled: Bool
+    let videoURL: URL?
+
+    @StateObject private var dragFeedback = TimelineDragFeedback()
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = geo.size.width
+            let clips = zoomDescriptors
+            let candidates = TimelineSnapMath.candidates(playhead: editorVM.playheadTime, duration: duration, width: width, clips: clips)
+            let threshold = TimelineSnapMath.threshold(duration: duration, width: width)
+
+            ZStack(alignment: .topLeading) {
+                FilmstripView(videoURL: videoURL, duration: duration)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .gesture(addZoomGesture(width: width))
+
+                ForEach(clips) { descriptor in
+                    descriptor.makeView(
+                        duration: duration,
+                        totalWidth: width,
+                        laneHeight: height,
+                        showsDeleteControls: showsDeleteControls,
+                        extendsWithShift: extendsWithShift,
+                        snapCandidates: candidates,
+                        snapThresholdSeconds: threshold,
+                        snapEnabled: snapEnabled,
+                        dragFeedback: dragFeedback
+                    )
+                }
+
+                snapGuide(width: width)
+            }
+        }
+        .frame(height: height)
+    }
+
+    private var zoomDescriptors: [ClipDescriptor] {
+        editorVM.zoomSegments.map { segment in
+            ClipDescriptor(
+                id: segment.id,
+                kind: .zoom(manual: segment.source == .manual),
+                label: segment.zoomRect == .zero ? "Full" : "Zoom",
+                startTime: segment.startTime,
+                endTime: segment.endTime,
+                isSelected: editorVM.selectedTimelineItem == .zoom(segment.id),
+                minimumDuration: 0.3,
+                onSelect: { editorVM.selectZoomSegment(segment.id) },
+                onBeginEdit: { editorVM.beginInteractiveEdit() },
+                onUpdate: { start, end in
+                    editorVM.updateZoomSegmentTiming(segment.id, startTime: start, endTime: end)
+                },
+                onEndEdit: { editorVM.endInteractiveEdit() },
+                onRemove: { editorVM.removeZoomSegment(segment.id) }
+            )
+        }
+    }
+
+    private func addZoomGesture(width: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onEnded { value in
+                guard abs(value.translation.width) < 3, abs(value.translation.height) < 3 else { return }
+                let clampedX = max(0, min(width, value.location.x))
+                let time = Double(clampedX / max(width, 1)) * max(duration, 0.001)
+                editorVM.addZoomSegment(at: time)
+                editorVM.selectedTool = .zoom
+            }
+    }
+
+    @ViewBuilder
+    private func snapGuide(width: CGFloat) -> some View {
+        if let time = dragFeedback.snapGuideTime {
+            let x = CGFloat(time / max(duration, 0.001)) * width
+            Rectangle()
+                .fill(Color.white.opacity(0.7))
+                .frame(width: 1)
+                .frame(height: height)
+                .position(x: x, y: height / 2)
+                .allowsHitTesting(false)
+        }
+    }
+}
+
+// MARK: - Keys lane
+
+struct KeysTimelineLane: View {
+    @ObservedObject var editorVM: EditorVM
+    let duration: Double
+    let height: CGFloat
+    let showsDeleteControls: Bool
+
+    var body: some View {
+        GeometryReader { geo in
+            let events = TimelineEventSampler.sampleKeyEvents(
+                editorVM.recordedKeyEvents,
+                duration: duration,
+                width: geo.size.width
+            )
+            ZStack(alignment: .leading) {
+                Rectangle().fill(Color(nsColor: .underPageBackgroundColor))
+
+                ForEach(events) { event in
+                    let x = (event.timestamp / max(duration, 0.001)) * geo.size.width
+                    KeyPill(
+                        text: event.displayString,
+                        isSelected: editorVM.selectedTimelineItem == .keyEvent(event.id),
+                        showsDelete: showsDeleteControls,
+                        onRemove: { editorVM.removeKeyEvent(event.id) }
+                    )
+                    .position(x: max(26, min(geo.size.width - 26, x)), y: height / 2)
+                    .contextMenu {
+                        Button("Hide this key") { editorVM.removeKeyEvent(event.id) }
+                        Button("Hide all \(event.displayString)") {
+                            _ = editorVM.removeKeyEvents(matching: event.displayString)
+                        }
+                    }
+                }
+            }
+        }
+        .frame(height: height)
+    }
+}
+
+private struct KeyPill: View {
+    let text: String
+    let isSelected: Bool
+    let showsDelete: Bool
     let onRemove: () -> Void
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            Text(event.displayString)
+            Text(text)
                 .font(.caption2.weight(.semibold))
                 .lineLimit(1)
                 .padding(.horizontal, 8)
@@ -776,986 +1231,69 @@ private struct ShortcutEventBlock: View {
                     Capsule()
                         .fill(Color.accentColor.opacity(0.26))
                         .overlay(
-                            Capsule()
-                                .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 2)
+                            Capsule().stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 2)
                         )
                 )
                 .foregroundColor(.accentColor)
-            if showsDeleteControls {
+                .onTapGesture { onRemove() }
+
+            if showsDelete {
                 TimelineDeleteButton(action: onRemove)
                     .offset(x: 7, y: -7)
             }
         }
-            .simultaneousGesture(TapGesture().onEnded(onSelect))
-            .help("Click to hide this shortcut badge. Right-click to hide all matching badges.")
+        .help("Click to hide this shortcut badge. Right-click to hide all matching badges.")
     }
 }
 
-struct CameraLayoutTimelineTrackView: View {
-    @ObservedObject var editorVM: EditorVM
-    let currentTime: Double
-    let showsDeleteControls: Bool
-    let extendsWithShift: Bool
+// MARK: - Ruler
+
+/// The ruler: tick labels + a scrub/selection gesture. It draws no playhead of its own;
+/// the single global playhead is overlaid by `TimelineView` so it spans every lane.
+struct TimelineRulerBody: View {
+    let duration: Double
+    let onChange: (CGFloat, CGFloat) -> Void
+    let onEnd: (CGFloat, CGFloat) -> Void
 
     var body: some View {
-        GeometryReader { geometry in
+        GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Rectangle()
-                    .fill(Color(nsColor: .underPageBackgroundColor))
-
-                HStack(spacing: 6) {
-                    Label("Layouts", systemImage: "rectangle.split.2x1")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Menu {
-                        ForEach(CameraLayoutMode.allCases) { mode in
-                            Button(mode.label) {
-                                editorVM.addCameraLayout(mode: mode)
-                            }
-                        }
-                    } label: {
-                        Image(systemName: "plus.circle")
-                    }
-                    .menuStyle(.borderlessButton)
-                    .frame(width: 28, height: 28)
-                }
-                .padding(.horizontal, 8)
-
-                ForEach(editorVM.cameraLayouts) { layout in
-                    CameraLayoutBlock(
-                        layout: layout,
-                        isSelected: editorVM.selectedTimelineItem == .cameraLayout(layout.id),
-                        duration: editorVM.duration,
-                        totalWidth: geometry.size.width,
-                        height: geometry.size.height,
-                        showsDeleteControls: showsDeleteControls,
-                        extendsWithShift: extendsWithShift,
-                        onSelect: {
-                            editorVM.selectCameraLayout(layout.id)
-                            editorVM.seek(to: layout.startTime)
-                        },
-                        onBeginEdit: {
-                            editorVM.beginInteractiveEdit()
-                        },
-                        onUpdate: editorVM.updateCameraLayout,
-                        onEndEdit: {
-                            editorVM.endInteractiveEdit()
-                        },
-                        onRemove: {
-                            editorVM.removeCameraLayout(layout.id)
-                        }
-                    )
-                }
-
-                Rectangle()
-                    .fill(Color.accentColor.opacity(0.8))
-                    .frame(width: 2)
-                    .position(
-                        x: (currentTime / max(editorVM.duration, 0.001)) * geometry.size.width,
-                        y: geometry.size.height / 2
-                    )
-            }
-        }
-        .frame(height: 36)
-    }
-}
-
-struct EffectSegmentsTimelineTrackView: View {
-    @ObservedObject var editorVM: EditorVM
-    let currentTime: Double
-    let showsDeleteControls: Bool
-    let extendsWithShift: Bool
-
-    var body: some View {
-        GeometryReader { geometry in
-            ZStack(alignment: .leading) {
-                Rectangle()
-                    .fill(Color(nsColor: .underPageBackgroundColor))
-
-                HStack(spacing: 6) {
-                    Label("Segments", systemImage: "slider.horizontal.3")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Menu {
-                        ForEach(EffectSegmentPreset.allCases) { preset in
-                            Button(preset.title) {
-                                _ = editorVM.addEffectSegment(
-                                    startTime: editorVM.playheadTime,
-                                    endTime: min(editorVM.duration, editorVM.playheadTime + 5),
-                                    preset: preset
-                                )
-                            }
-                        }
-                    } label: {
-                        Image(systemName: "plus.circle")
-                    }
-                    .menuStyle(.borderlessButton)
-                    .frame(width: 28, height: 28)
-                }
-                .padding(.horizontal, 8)
-
-                ForEach(editorVM.effectSegments) { segment in
-                    EffectSegmentTimelineBlock(
-                        segment: segment,
-                        isSelected: editorVM.selectedTimelineItem == .effectSegment(segment.id),
-                        duration: editorVM.duration,
-                        totalWidth: geometry.size.width,
-                        height: geometry.size.height,
-                        showsDeleteControls: showsDeleteControls,
-                        extendsWithShift: extendsWithShift,
-                        onSelect: {
-                            editorVM.selectEffectSegment(segment.id)
-                            editorVM.selectedTool = .effects
-                            editorVM.seek(to: segment.startTime)
-                        },
-                        onBeginEdit: {
-                            editorVM.beginInteractiveEdit()
-                        },
-                        onUpdate: editorVM.updateEffectSegment,
-                        onEndEdit: {
-                            editorVM.endInteractiveEdit()
-                        },
-                        onRemove: {
-                            editorVM.removeEffectSegment(segment.id)
-                        }
-                    )
-                }
-
-                Rectangle()
-                    .fill(Color.accentColor.opacity(0.8))
-                    .frame(width: 2)
-                    .position(
-                        x: (currentTime / max(editorVM.duration, 0.001)) * geometry.size.width,
-                        y: geometry.size.height / 2
-                    )
-            }
-        }
-        .frame(height: 36)
-    }
-}
-
-private struct EffectSegmentTimelineBlock: View {
-    let segment: EffectSegment
-    let isSelected: Bool
-    let duration: Double
-    let totalWidth: CGFloat
-    let height: CGFloat
-    let showsDeleteControls: Bool
-    let extendsWithShift: Bool
-    let onSelect: () -> Void
-    let onBeginEdit: () -> Void
-    let onUpdate: (EffectSegment) -> Void
-    let onEndEdit: () -> Void
-    let onRemove: () -> Void
-
-    @State private var dragStart: Double?
-    @State private var dragEnd: Double?
-
-    var body: some View {
-        let safeDuration = max(duration, 0.001)
-        let startX = (segment.startTime / safeDuration) * totalWidth
-        let width = max((segment.duration / safeDuration) * totalWidth, 34)
-
-        ZStack(alignment: .topTrailing) {
-            Label(segment.name, systemImage: "slider.horizontal.3")
-                .font(.caption2.weight(.semibold))
-                .lineLimit(1)
-                .labelStyle(.titleAndIcon)
-                .padding(.horizontal, 8)
-                .frame(width: width, height: 24)
-                .background(
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(Color.indigo.opacity(0.28))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 5)
-                                .stroke(isSelected ? Color.indigo : Color.clear, lineWidth: 2)
-                        )
-                )
-                .foregroundColor(.indigo)
-            HStack(spacing: 0) {
-                ResizeHandle(color: .indigo)
-                    .highPriorityGesture(resizeGesture(edge: .leading))
-                Spacer(minLength: 0)
-                ResizeHandle(color: .indigo)
-                    .highPriorityGesture(resizeGesture(edge: .trailing))
-            }
-            .frame(width: width, height: 24)
-            if showsDeleteControls {
-                TimelineDeleteButton(action: onRemove)
-                    .offset(x: 7, y: -7)
-            }
-        }
-        .position(x: startX + width / 2, y: height / 2)
-        .simultaneousGesture(TapGesture().onEnded(onSelect))
-        .highPriorityGesture(moveGesture)
-        .contextMenu {
-            ForEach(EffectSegmentPreset.allCases) { preset in
-                Button(preset.title) {
-                    var updated = segment
-                    preset.apply(to: &updated)
-                    onUpdate(updated)
-                }
-            }
-            Divider()
-            Button("Remove Segment", role: .destructive, action: onRemove)
-        }
-    }
-
-    private var moveGesture: some Gesture {
-        DragGesture()
-            .onChanged { value in
-                initializeDragState()
-                let safeDuration = max(duration, 0.001)
-                let delta = Double(value.translation.width / max(totalWidth, 1)) * safeDuration
-                guard let dragStart, let dragEnd else { return }
-                var updated = segment
-                if extendsWithShift {
-                    if delta >= 0 {
-                        updated.startTime = dragStart
-                        updated.endTime = min(safeDuration, dragEnd + delta)
-                    } else {
-                        updated.startTime = max(0, dragStart + delta)
-                        updated.endTime = dragEnd
-                    }
-                } else {
-                    let length = max(0.4, dragEnd - dragStart)
-                    updated.startTime = max(0, min(safeDuration - length, dragStart + delta))
-                    updated.endTime = updated.startTime + length
-                }
-                onUpdate(updated)
-            }
-            .onEnded { _ in
-                dragStart = nil
-                dragEnd = nil
-                onEndEdit()
-            }
-    }
-
-    private func resizeGesture(edge: ResizeEdge) -> some Gesture {
-        DragGesture()
-            .onChanged { value in
-                initializeDragState()
-                let safeDuration = max(duration, 0.001)
-                let delta = Double(value.translation.width / max(totalWidth, 1)) * safeDuration
-                guard let dragStart, let dragEnd else { return }
-                var updated = segment
-                switch edge {
-                case .leading:
-                    updated.startTime = dragStart + delta
-                    updated.endTime = dragEnd
-                case .trailing:
-                    updated.startTime = dragStart
-                    updated.endTime = dragEnd + delta
-                }
-                onUpdate(updated)
-            }
-            .onEnded { _ in
-                dragStart = nil
-                dragEnd = nil
-                onEndEdit()
-            }
-    }
-
-    private func initializeDragState() {
-        if dragStart == nil {
-            onBeginEdit()
-            dragStart = segment.startTime
-            dragEnd = segment.endTime
-        }
-    }
-}
-
-private struct CameraLayoutBlock: View {
-    let layout: CameraLayoutSegment
-    let isSelected: Bool
-    let duration: Double
-    let totalWidth: CGFloat
-    let height: CGFloat
-    let showsDeleteControls: Bool
-    let extendsWithShift: Bool
-    let onSelect: () -> Void
-    let onBeginEdit: () -> Void
-    let onUpdate: (CameraLayoutSegment) -> Void
-    let onEndEdit: () -> Void
-    let onRemove: () -> Void
-
-    @State private var dragStart: Double?
-    @State private var dragEnd: Double?
-
-    var body: some View {
-        let startX = (layout.startTime / max(duration, 0.001)) * totalWidth
-        let width = max((max(0.1, layout.endTime - layout.startTime) / max(duration, 0.001)) * totalWidth, 28)
-
-        ZStack(alignment: .topTrailing) {
-            Label(layout.mode.label, systemImage: layout.mode.systemImage)
-                .font(.caption2.weight(.semibold))
-                .lineLimit(1)
-                .labelStyle(.titleAndIcon)
-                .padding(.horizontal, 8)
-                .frame(width: width, height: 24)
-                .background(
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(Color.purple.opacity(0.28))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 5)
-                                .stroke(isSelected ? Color.purple : Color.clear, lineWidth: 2)
-                        )
-                )
-                .foregroundColor(.purple)
-            HStack(spacing: 0) {
-                ResizeHandle(color: .purple)
-                    .highPriorityGesture(resizeGesture(edge: .leading))
-                Spacer(minLength: 0)
-                ResizeHandle(color: .purple)
-                    .highPriorityGesture(resizeGesture(edge: .trailing))
-            }
-            .frame(width: width, height: 24)
-            if showsDeleteControls {
-                TimelineDeleteButton(action: onRemove)
-                    .offset(x: 7, y: -7)
-            }
-        }
-            .position(x: startX + width / 2, y: height / 2)
-            .simultaneousGesture(TapGesture().onEnded(onSelect))
-            .highPriorityGesture(moveGesture)
-            .contextMenu {
-                ForEach(CameraLayoutMode.allCases) { mode in
-                    Button(mode.label) {
-                        var updated = layout
-                        updated.mode = mode
-                        onUpdate(updated)
-                    }
-                }
-                Divider()
-                Button("Remove", role: .destructive, action: onRemove)
-            }
-    }
-
-    private var moveGesture: some Gesture {
-        DragGesture()
-            .onChanged { value in
-                initializeDragState()
-                let delta = Double(value.translation.width / max(totalWidth, 1)) * duration
-                guard let dragStart, let dragEnd else { return }
-                var updated = layout
-                if extendsWithShift {
-                    if delta >= 0 {
-                        updated.startTime = dragStart
-                        updated.endTime = min(duration, dragEnd + delta)
-                    } else {
-                        updated.startTime = max(0, dragStart + delta)
-                        updated.endTime = dragEnd
-                    }
-                } else {
-                    let length = max(0.4, dragEnd - dragStart)
-                    updated.startTime = max(0, min(duration - length, dragStart + delta))
-                    updated.endTime = updated.startTime + length
-                }
-                onUpdate(updated)
-            }
-            .onEnded { _ in
-                dragStart = nil
-                dragEnd = nil
-                onEndEdit()
-            }
-    }
-
-    private func resizeGesture(edge: ResizeEdge) -> some Gesture {
-        DragGesture()
-            .onChanged { value in
-                initializeDragState()
-                let delta = Double(value.translation.width / max(totalWidth, 1)) * duration
-                guard let dragStart, let dragEnd else { return }
-                var updated = layout
-                switch edge {
-                case .leading:
-                    updated.startTime = dragStart + delta
-                    updated.endTime = dragEnd
-                case .trailing:
-                    updated.startTime = dragStart
-                    updated.endTime = dragEnd + delta
-                }
-                onUpdate(updated)
-            }
-            .onEnded { _ in
-                dragStart = nil
-                dragEnd = nil
-                onEndEdit()
-            }
-    }
-
-    private func initializeDragState() {
-        if dragStart == nil {
-            onBeginEdit()
-            dragStart = layout.startTime
-            dragEnd = layout.endTime
-        }
-    }
-}
-
-struct OverlayTimelineTrackView: View {
-    @ObservedObject var editorVM: EditorVM
-    let currentTime: Double
-    let showsDeleteControls: Bool
-    let extendsWithShift: Bool
-
-    var body: some View {
-        GeometryReader { geometry in
-            ZStack(alignment: .leading) {
-                Rectangle()
-                    .fill(Color(nsColor: .underPageBackgroundColor))
-
-                HStack(spacing: 6) {
-                    Label("Effects", systemImage: "rectangle.on.rectangle")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Menu {
-                        ForEach(OverlayType.allCases, id: \.self) { type in
-                            Button(type.label) {
-                                editorVM.addOverlay(type: type, at: editorVM.playheadTime)
-                            }
-                        }
-                    } label: {
-                        Image(systemName: "plus.circle")
-                    }
-                    .menuStyle(.borderlessButton)
-                    .frame(width: 28, height: 28)
-                }
-                .padding(.horizontal, 8)
-
-                ForEach(editorVM.overlays) { overlay in
-                    OverlayTimelineBlock(
-                        overlay: overlay,
-                        isSelected: editorVM.selectedTimelineItem == .overlay(overlay.id),
-                        duration: editorVM.duration,
-                        totalWidth: geometry.size.width,
-                        height: geometry.size.height,
-                        showsDeleteControls: showsDeleteControls,
-                        extendsWithShift: extendsWithShift,
-                        onSelect: {
-                            editorVM.selectOverlay(overlay.id)
-                            editorVM.seek(to: overlay.startTime)
-                        },
-                        onBeginEdit: {
-                            editorVM.beginInteractiveEdit()
-                        },
-                        onUpdate: editorVM.updateOverlay,
-                        onEndEdit: {
-                            editorVM.endInteractiveEdit()
-                        },
-                        onRemove: {
-                            editorVM.removeOverlay(overlay.id)
-                        }
-                    )
-                }
-
-                Rectangle()
-                    .fill(Color.accentColor.opacity(0.8))
-                    .frame(width: 2)
-                    .position(
-                        x: (currentTime / max(editorVM.duration, 0.001)) * geometry.size.width,
-                        y: geometry.size.height / 2
-                    )
-            }
-        }
-        .frame(height: 36)
-    }
-}
-
-private struct OverlayTimelineBlock: View {
-    let overlay: OverlayElement
-    let isSelected: Bool
-    let duration: Double
-    let totalWidth: CGFloat
-    let height: CGFloat
-    let showsDeleteControls: Bool
-    let extendsWithShift: Bool
-    let onSelect: () -> Void
-    let onBeginEdit: () -> Void
-    let onUpdate: (OverlayElement) -> Void
-    let onEndEdit: () -> Void
-    let onRemove: () -> Void
-
-    @State private var dragStart: Double?
-    @State private var dragEnd: Double?
-
-    var body: some View {
-        let safeDuration = max(duration, 0.001)
-        let startX = (overlay.startTime / safeDuration) * totalWidth
-        let width = max(((overlay.endTime - overlay.startTime) / safeDuration) * totalWidth, 34)
-
-        ZStack(alignment: .topTrailing) {
-            Label(overlayLabel, systemImage: overlayIcon)
-                .font(.caption2.weight(.semibold))
-                .lineLimit(1)
-                .labelStyle(.titleAndIcon)
-                .padding(.horizontal, 8)
-                .frame(width: width, height: 24)
-                .background(
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(Color.teal.opacity(0.26))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 5)
-                                .stroke(isSelected ? Color.teal : Color.clear, lineWidth: 2)
-                        )
-                )
-                .foregroundColor(.teal)
-            HStack(spacing: 0) {
-                ResizeHandle(color: .teal)
-                    .highPriorityGesture(resizeGesture(edge: .leading))
-                Spacer(minLength: 0)
-                ResizeHandle(color: .teal)
-                    .highPriorityGesture(resizeGesture(edge: .trailing))
-            }
-            .frame(width: width, height: 24)
-            if showsDeleteControls {
-                TimelineDeleteButton(action: onRemove)
-                    .offset(x: 7, y: -7)
-            }
-        }
-            .position(x: startX + width / 2, y: height / 2)
-            .simultaneousGesture(TapGesture().onEnded(onSelect))
-            .highPriorityGesture(moveGesture)
-            .contextMenu {
-                ForEach(OverlayType.allCases, id: \.self) { type in
-                    Button(type.label) {
-                        var updated = overlay
-                        updated.type = type
-                        onUpdate(updated)
-                    }
-                }
-                Divider()
-                Button("Remove Effect", role: .destructive, action: onRemove)
-            }
-    }
-
-    private var overlayLabel: String {
-        if overlay.type == .text {
-            let text = overlay.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty { return text }
-        }
-        return overlay.type.label
-    }
-
-    private var overlayIcon: String {
-        switch overlay.type {
-        case .blur:
-            return "rectangle.dashed"
-        case .highlight:
-            return "highlighter"
-        case .spotlight:
-            return "circle.dashed"
-        case .text:
-            return "textformat"
-        }
-    }
-
-    private var moveGesture: some Gesture {
-        DragGesture()
-            .onChanged { value in
-                initializeDragState()
-                let safeDuration = max(duration, 0.001)
-                let delta = Double(value.translation.width / max(totalWidth, 1)) * safeDuration
-                guard let dragStart, let dragEnd else { return }
-                var updated = overlay
-                if extendsWithShift {
-                    if delta >= 0 {
-                        updated.startTime = dragStart
-                        updated.endTime = min(safeDuration, dragEnd + delta)
-                    } else {
-                        updated.startTime = max(0, dragStart + delta)
-                        updated.endTime = dragEnd
-                    }
-                } else {
-                    let length = max(0.2, dragEnd - dragStart)
-                    let newStart = max(0, min(safeDuration - length, dragStart + delta))
-                    updated.startTime = newStart
-                    updated.endTime = newStart + length
-                }
-                onUpdate(updated)
-            }
-            .onEnded { _ in
-                dragStart = nil
-                dragEnd = nil
-                onEndEdit()
-            }
-    }
-
-    private func resizeGesture(edge: ResizeEdge) -> some Gesture {
-        DragGesture()
-            .onChanged { value in
-                initializeDragState()
-                let safeDuration = max(duration, 0.001)
-                let delta = Double(value.translation.width / max(totalWidth, 1)) * safeDuration
-                guard let dragStart, let dragEnd else { return }
-                var updated = overlay
-                switch edge {
-                case .leading:
-                    updated.startTime = dragStart + delta
-                    updated.endTime = dragEnd
-                case .trailing:
-                    updated.startTime = dragStart
-                    updated.endTime = dragEnd + delta
-                }
-                onUpdate(updated)
-            }
-            .onEnded { _ in
-                dragStart = nil
-                dragEnd = nil
-                onEndEdit()
-            }
-    }
-
-    private func initializeDragState() {
-        if dragStart == nil {
-            onBeginEdit()
-            dragStart = overlay.startTime
-            dragEnd = overlay.endTime
-        }
-    }
-}
-
-struct AudioTimelineTrackView: View {
-    let title: String
-    let systemImage: String
-    let audioURL: URL?
-    let currentTime: Double
-    let duration: Double
-    let editActions: [EditAction]
-    let loops: Bool
-    let trailingText: String?
-
-    var body: some View {
-        VStack(spacing: 4) {
-            HStack(spacing: 8) {
-                Label(title, systemImage: systemImage)
-                    .font(.caption.weight(.semibold))
-                    .foregroundColor(.secondary)
-                Spacer()
-                if let trailingText {
-                    Text(trailingText)
-                        .font(.caption.monospacedDigit())
-                        .foregroundColor(.secondary)
-                }
-            }
-            .padding(.horizontal, 8)
-
-            AudioWaveformView(
-                audioURL: audioURL,
-                currentTime: currentTime,
-                duration: max(duration, 0.001),
-                editActions: editActions,
-                loops: loops,
-                muteCutRanges: true
-            )
-            .frame(height: 42)
-            .clipShape(RoundedRectangle(cornerRadius: 5))
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(Color(nsColor: .underPageBackgroundColor))
-    }
-}
-
-struct EditRegionsTrackView: View {
-    @ObservedObject var editorVM: EditorVM
-    let currentTime: Double
-    let showsDeleteControls: Bool
-    let extendsWithShift: Bool
-
-    var body: some View {
-        GeometryReader { geometry in
-            ZStack(alignment: .leading) {
-                Rectangle()
-                    .fill(Color(nsColor: .underPageBackgroundColor))
-
-                if let start = editorVM.selectedRangeStart,
-                   let end = editorVM.selectedRangeEnd,
-                   abs(end - start) >= 0.05 {
-                    let left = min(start, end) / safeDuration * geometry.size.width
-                    let width = abs(end - start) / safeDuration * geometry.size.width
-                    Rectangle()
-                        .fill(Color.accentColor.opacity(0.12))
-                        .frame(width: width)
-                        .position(x: left + width / 2, y: geometry.size.height / 2)
-                }
-
-                ForEach(editorVM.editActions) { action in
-                    EditableEditActionBlock(
-                        action: action,
-                        isSelected: editorVM.selectedTimelineItem == .editAction(action.id),
-                        duration: editorVM.duration,
-                        totalWidth: geometry.size.width,
-                        height: geometry.size.height,
-                        showsDeleteControls: showsDeleteControls,
-                        extendsWithShift: extendsWithShift,
-                        onSelect: {
-                            editorVM.selectEditAction(action.id)
-                            editorVM.seek(to: action.startTime)
-                        },
-                        onBeginEdit: {
-                            editorVM.beginInteractiveEdit()
-                        },
-                        onUpdate: { start, end in
-                            editorVM.updateEditActionTiming(action.id, startTime: start, endTime: end)
-                        },
-                        onEndEdit: {
-                            editorVM.endInteractiveEdit()
-                        },
-                        onRemove: {
-                            editorVM.removeEditAction(action.id)
-                        }
-                    )
-                }
-
-                Rectangle()
-                    .fill(Color.accentColor)
-                    .frame(width: 2)
-                    .position(x: (currentTime / safeDuration) * geometry.size.width, y: geometry.size.height / 2)
-            }
-        }
-        .frame(height: 36)
-    }
-
-    private var safeDuration: Double {
-        max(editorVM.duration, 0.001)
-    }
-}
-
-struct EditableEditActionBlock: View {
-    let action: EditAction
-    let isSelected: Bool
-    let duration: Double
-    let totalWidth: CGFloat
-    let height: CGFloat
-    let showsDeleteControls: Bool
-    let extendsWithShift: Bool
-    let onSelect: () -> Void
-    let onBeginEdit: () -> Void
-    let onUpdate: (Double, Double) -> Void
-    let onEndEdit: () -> Void
-    let onRemove: () -> Void
-
-    @State private var dragStart: Double?
-    @State private var dragEnd: Double?
-
-    var body: some View {
-        let safeDuration = max(duration, 0.001)
-        let startX = (action.startTime / safeDuration) * totalWidth
-        let width = max((action.duration / safeDuration) * totalWidth, 12)
-        let fillColor: Color = switch action.type {
-        case .cut:
-            .red.opacity(0.3)
-        case .speedChange:
-            .blue.opacity(0.3)
-        case .hideCursor:
-            .orange.opacity(0.32)
-        }
-        let accentColor: Color = switch action.type {
-        case .cut:
-            .red
-        case .speedChange:
-            .blue
-        case .hideCursor:
-            .orange
-        }
-        let label: String = switch action.type {
-        case .cut:
-            "Cut"
-        case .speedChange:
-            "Speed"
-        case .hideCursor:
-            "Hide Cursor"
-        }
-
-        ZStack {
-            RoundedRectangle(cornerRadius: 4)
-                .fill(fillColor)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 4)
-                        .stroke(isSelected ? accentColor : Color.clear, lineWidth: 2)
-                )
-            HStack(spacing: 0) {
-                ResizeHandle(color: accentColor)
-                    .highPriorityGesture(resizeGesture(edge: .leading))
-                Spacer(minLength: 0)
-                if showsDeleteControls {
-                    TimelineDeleteButton(action: onRemove)
-                        .offset(y: -8)
-                }
-                ResizeHandle(color: accentColor)
-                    .highPriorityGesture(resizeGesture(edge: .trailing))
-            }
-            Text(label)
-                .font(.caption2)
-                .foregroundColor(accentColor)
-        }
-        .frame(width: width, height: 24)
-        .position(x: startX + width / 2, y: height / 2)
-        .simultaneousGesture(TapGesture().onEnded(onSelect))
-        .highPriorityGesture(moveGesture)
-        .contextMenu {
-            Button("Remove", action: onRemove)
-        }
-    }
-
-    private var moveGesture: some Gesture {
-        DragGesture()
-            .onChanged { value in
-                initializeDragState()
-                let safeDuration = max(duration, 0.001)
-                let delta = Double(value.translation.width / max(totalWidth, 1)) * safeDuration
-                guard let dragStart, let dragEnd else { return }
-                if extendsWithShift {
-                    if delta >= 0 {
-                        onUpdate(dragStart, min(safeDuration, dragEnd + delta))
-                    } else {
-                        onUpdate(max(0, dragStart + delta), dragEnd)
-                    }
-                } else {
-                    let length = dragEnd - dragStart
-                    let newStart = max(0, min(safeDuration - length, dragStart + delta))
-                    onUpdate(newStart, newStart + length)
-                }
-            }
-            .onEnded { _ in
-                dragStart = nil
-                dragEnd = nil
-                onEndEdit()
-            }
-    }
-
-    private func resizeGesture(edge: ResizeEdge) -> some Gesture {
-        DragGesture()
-            .onChanged { value in
-                initializeDragState()
-                let safeDuration = max(duration, 0.001)
-                let delta = Double(value.translation.width / max(totalWidth, 1)) * safeDuration
-                guard let dragStart, let dragEnd else { return }
-                switch edge {
-                case .leading:
-                    onUpdate(dragStart + delta, dragEnd)
-                case .trailing:
-                    onUpdate(dragStart, dragEnd + delta)
-                }
-            }
-            .onEnded { _ in
-                dragStart = nil
-                dragEnd = nil
-                onEndEdit()
-            }
-    }
-
-    private func initializeDragState() {
-        if dragStart == nil {
-            onBeginEdit()
-            dragStart = action.startTime
-            dragEnd = action.endTime
-        }
-    }
-}
-
-enum ResizeEdge {
-    case leading
-    case trailing
-}
-
-struct ResizeHandle: View {
-    let color: Color
-
-    var body: some View {
-        ZStack {
-            Rectangle()
-                .fill(Color.clear)
-                .frame(width: 16)
-            RoundedRectangle(cornerRadius: 2)
-                .fill(color.opacity(0.82))
-                .frame(width: 6)
-        }
-        .frame(width: 16)
-        .contentShape(Rectangle())
-    }
-}
-
-struct ResizeTimelineHeightHandle: View {
-    var body: some View {
-        VStack(spacing: 3) {
-            Capsule()
-                .fill(Color.secondary.opacity(0.55))
-                .frame(width: 26, height: 3)
-            Capsule()
-                .fill(Color.secondary.opacity(0.38))
-                .frame(width: 26, height: 3)
-        }
-        .frame(width: 42, height: 28)
-        .contentShape(Rectangle())
-    }
-}
-
-struct TimelineDeleteButton: View {
-    let action: () -> Void
-
-    var body: some View {
-        Button(role: .destructive, action: action) {
-            Image(systemName: "xmark.circle.fill")
-                .font(.system(size: 14, weight: .semibold))
-                .symbolRenderingMode(.palette)
-                .foregroundStyle(.white, .red)
-                .shadow(radius: 1)
-        }
-        .buttonStyle(.plain)
-        .frame(width: 18, height: 18)
-        .help("Remove selected timeline item")
-    }
-}
-
-struct TimelineRuler: View {
-    let duration: Double
-    @Binding var currentTime: Double
-    
-    var body: some View {
-        GeometryReader { geometry in
-            ZStack(alignment: .leading) {
-                ForEach(TimelineTickPlanner.ticks(duration: duration, width: geometry.size.width), id: \.self) { second in
-                    VStack(spacing: 4) {
+                ForEach(TimelineTickPlanner.ticks(duration: duration, width: geo.size.width), id: \.self) { second in
+                    let x = (Double(second) / max(duration, 0.001)) * geo.size.width
+                    VStack(spacing: 3) {
                         Rectangle()
-                            .fill(Color.secondary.opacity(0.28))
+                            .fill(Color.secondary.opacity(0.35))
                             .frame(width: 1, height: 6)
                         Text(formatTime(second))
-                            .font(.caption.monospacedDigit())
+                            .font(.caption2.monospacedDigit())
                             .foregroundColor(.secondary)
                             .lineLimit(1)
-                            .frame(width: 54)
                     }
-                    .position(
-                        x: (Double(second) / max(duration, 0.001)) * geometry.size.width,
-                        y: geometry.size.height / 2
-                    )
+                    .position(x: x, y: geo.size.height / 2)
                 }
-                
-                // Playhead line
-                Rectangle()
-                    .fill(Color.red)
-                    .frame(width: 2)
-                    .position(x: (currentTime / max(duration, 0.001)) * geometry.size.width, y: geometry.size.height / 2)
-                
-                // Playhead handle
-                Circle()
-                    .fill(Color.red)
-                    .frame(width: 12, height: 12)
-                    .position(x: (currentTime / max(duration, 0.001)) * geometry.size.width, y: geometry.size.height / 2)
             }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        let clampedX = max(0, min(geo.size.width, value.location.x))
+                        onChange(clampedX, geo.size.width)
+                    }
+                    .onEnded { value in
+                        let clampedX = max(0, min(geo.size.width, value.location.x))
+                        onEnd(clampedX, geo.size.width)
+                    }
+            )
         }
-        .frame(height: 30)
+        .background(Color(nsColor: .controlBackgroundColor))
     }
-    
+
     private func formatTime(_ seconds: Int) -> String {
         TimecodeFormatter.positional(seconds)
     }
 }
+
+// MARK: - Tick planner (signature used by EditorProFeatureTests)
 
 enum TimelineTickPlanner {
     static func ticks(duration: Double, width: CGFloat, minimumSpacing: CGFloat = 76) -> [Int] {
@@ -1771,7 +1309,6 @@ enum TimelineTickPlanner {
             ticks.append(value)
             value += step
         }
-
         if ticks.last != lastSecond {
             ticks.append(lastSecond)
         }
@@ -1781,5 +1318,18 @@ enum TimelineTickPlanner {
     private static func niceStep(atLeast rawStep: Double) -> Int {
         let candidates = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1_800, 3_600]
         return candidates.first { Double($0) >= rawStep } ?? Int(ceil(rawStep / 3_600)) * 3_600
+    }
+}
+
+// MARK: - Resize handle (timeline height)
+
+struct ResizeTimelineHeightHandle: View {
+    var body: some View {
+        VStack(spacing: 3) {
+            Capsule().fill(Color.secondary.opacity(0.55)).frame(width: 26, height: 3)
+            Capsule().fill(Color.secondary.opacity(0.38)).frame(width: 26, height: 3)
+        }
+        .frame(width: 42, height: 28)
+        .contentShape(Rectangle())
     }
 }

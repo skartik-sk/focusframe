@@ -76,6 +76,13 @@ final class AudioProcessor: @unchecked Sendable {
         let makeupGain = Self.sanitizedMakeupGain(config.makeupGain)
         let compressionRatio = Self.sanitizedCompressionRatio(config.compressionRatio)
 
+        // DSP state carried across blocks so the gate envelope and high-pass filter are
+        // continuous. Resetting them per 8192-frame block pumps the gate at every boundary.
+        let channelCount = max(1, Int(inputFormat.channelCount))
+        var envelopes = [Float](repeating: 0, count: channelCount)
+        var hpfPreviousInputs = [Float](repeating: 0, count: channelCount)
+        var hpfPreviousOutputs = [Float](repeating: 0, count: channelCount)
+
         while inputFile.framePosition < inputFile.length {
             guard let buffer = AVAudioPCMBuffer(
                 pcmFormat: inputFormat,
@@ -91,7 +98,10 @@ final class AudioProcessor: @unchecked Sendable {
                 threshold: Float(gateThreshold),
                 floorGain: floorGain,
                 makeupGain: makeupGain,
-                compressionRatio: compressionRatio
+                compressionRatio: compressionRatio,
+                envelopes: &envelopes,
+                hpfPreviousInputs: &hpfPreviousInputs,
+                hpfPreviousOutputs: &hpfPreviousOutputs
             )
             try outputFile.write(from: buffer)
         }
@@ -104,7 +114,10 @@ final class AudioProcessor: @unchecked Sendable {
         threshold: Float,
         floorGain: Float,
         makeupGain: Float,
-        compressionRatio: Float
+        compressionRatio: Float,
+        envelopes: inout [Float],
+        hpfPreviousInputs: inout [Float],
+        hpfPreviousOutputs: inout [Float]
     ) {
         guard let channels = buffer.floatChannelData else { return }
         let channelCount = Int(buffer.format.channelCount)
@@ -117,10 +130,19 @@ final class AudioProcessor: @unchecked Sendable {
 
         for channelIndex in 0..<channelCount {
             let samples = channels[channelIndex]
-            applyHighPassFilter(to: samples, frameLength: frameLength, sampleRate: sampleRate, cutoff: 85)
+            applyHighPassFilter(
+                to: samples,
+                frameLength: frameLength,
+                sampleRate: sampleRate,
+                cutoff: 85,
+                previousInput: &hpfPreviousInputs[channelIndex],
+                previousOutput: &hpfPreviousOutputs[channelIndex]
+            )
             let adaptiveThreshold = min(0.08, max(threshold, estimateNoiseFloor(samples: samples, frameLength: frameLength) * 1.7))
             let closeThreshold = adaptiveThreshold * 0.55
-            var envelope: Float = 0
+            // Envelope is carried across blocks; resetting it to 0 per block re-closes the
+            // gate for several ms at every boundary (audible ~6 Hz flutter).
+            var envelope = envelopes[channelIndex]
             for frame in 0..<frameLength {
                 let sample = samples[frame]
                 let rectified = abs(sample)
@@ -131,6 +153,7 @@ final class AudioProcessor: @unchecked Sendable {
                 let cleaned = sample * gateGain * makeupGain
                 samples[frame] = softLimit(cleaned, ratio: ratio)
             }
+            envelopes[channelIndex] = envelope
         }
     }
 
@@ -138,15 +161,17 @@ final class AudioProcessor: @unchecked Sendable {
         to samples: UnsafeMutablePointer<Float>,
         frameLength: Int,
         sampleRate: Float,
-        cutoff: Float
+        cutoff: Float,
+        previousInput: inout Float,
+        previousOutput: inout Float
     ) {
         guard frameLength > 1, sampleRate > 0, cutoff > 0 else { return }
         let rc = 1.0 / (2.0 * Float.pi * cutoff)
         let dt = 1.0 / sampleRate
         let alpha = rc / (rc + dt)
-        var previousInput = samples[0]
-        var previousOutput: Float = 0
 
+        // `previousInput`/`previousOutput` are carried across blocks so the filter is
+        // continuous — resetting them per block inserts a transient at every boundary.
         for frame in 0..<frameLength {
             let input = samples[frame]
             let output = alpha * (previousOutput + input - previousInput)

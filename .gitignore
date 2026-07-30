@@ -27,3 +27,5 @@ DerivedData/
 
 # Raw local source recordings; optimized website media lives in frontend/public.
 /video/
+
+.superpowers/

@@ -64,9 +64,177 @@ private struct EditorMediaLoadResult: @unchecked Sendable {
 }
 
 @MainActor
+final class PlaybackClock: ObservableObject {
+    @Published var time: Double = 0
+}
+
+/// Streams hardware-decoded source frames for the editor preview via `AVAssetReader` —
+/// about 34× faster than per-frame `AVAssetImageGenerator.copyCGImage` (the ~88 ms/frame
+/// path that stuttered the preview at ~11 fps). Advances in presentation order during
+/// playback and reopens the reader near the target on seeks/scrubs. Mirrors the export
+/// `FrameSource`, including the per-frame deep copy that defeats the reader's recycled
+/// buffer pool.
+final class PreviewFrameSource: @unchecked Sendable {
+    private let asset: AVAsset
+    private let videoTrack: AVAssetTrack
+    private let sourceSize: CGSize
+    private let fallback: AVAssetImageGenerator
+    private var reader: AVAssetReader?
+    private var output: AVAssetReaderTrackOutput?
+    private var current: (CVPixelBuffer, CMTime)?
+    private var lookahead: (CVPixelBuffer, CMTime)?
+    private var started = false
+    private let lock = NSLock()
+
+    private init(asset: AVAsset, videoTrack: AVAssetTrack, sourceSize: CGSize, fallback: AVAssetImageGenerator) {
+        self.asset = asset
+        self.videoTrack = videoTrack
+        self.sourceSize = sourceSize
+        self.fallback = fallback
+    }
+
+    static func make(asset: AVAsset, sourceSize: CGSize) async -> PreviewFrameSource? {
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first else { return nil }
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = CMTime(seconds: 0.01, preferredTimescale: 600)
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 0.01, preferredTimescale: 600)
+        return PreviewFrameSource(asset: asset, videoTrack: track, sourceSize: sourceSize, fallback: generator)
+    }
+
+    private func openReader(startingAt startTime: CMTime) {
+        reader?.cancelReading()
+        reader = nil
+        output = nil
+
+        guard let newReader = try? AVAssetReader(asset: asset) else { return }
+        let trackOutput = AVAssetReaderTrackOutput(
+            track: videoTrack,
+            outputSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: max(1, Int(sourceSize.width)),
+                kCVPixelBufferHeightKey as String: max(1, Int(sourceSize.height))
+            ]
+        )
+        trackOutput.alwaysCopiesSampleData = false
+        if startTime.value > 0 {
+            newReader.timeRange = CMTimeRange(start: startTime, end: .positiveInfinity)
+        }
+        guard newReader.canAdd(trackOutput), newReader.startReading() else { return }
+        reader = newReader
+        output = trackOutput
+        started = false
+        current = nil
+        lookahead = nil
+    }
+
+    private func readNext() -> (CVPixelBuffer, CMTime)? {
+        guard let output,
+              let sample = output.copyNextSampleBuffer(),
+              let buffer = CMSampleBufferGetImageBuffer(sample) else {
+            return nil
+        }
+        let presentationTime = CMSampleBufferGetPresentationTimeStamp(sample)
+        guard let copied = Self.deepCopyPixelBuffer(buffer) else { return (buffer, presentationTime) }
+        return (copied, presentationTime)
+    }
+
+    /// Snapshots a reader buffer into a fresh, private pixel buffer so its backing is not
+    /// recycled and overwritten by a later decode (the export "frozen frame" bug).
+    private static func deepCopyPixelBuffer(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+        let width = CVPixelBufferGetWidth(source)
+        let height = CVPixelBufferGetHeight(source)
+        let format = CVPixelBufferGetPixelFormatType(source)
+
+        var copy: CVPixelBuffer?
+        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, format, nil, &copy)
+        guard status == kCVReturnSuccess, let copy else { return nil }
+
+        CVPixelBufferLockBaseAddress(source, [.readOnly])
+        CVPixelBufferLockBaseAddress(copy, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(copy, [])
+            CVPixelBufferUnlockBaseAddress(source, [.readOnly])
+        }
+
+        guard let sourceBase = CVPixelBufferGetBaseAddress(source),
+              let copyBase = CVPixelBufferGetBaseAddress(copy) else { return nil }
+
+        let sourceBytesPerRow = CVPixelBufferGetBytesPerRow(source)
+        let copyBytesPerRow = CVPixelBufferGetBytesPerRow(copy)
+        if sourceBytesPerRow == copyBytesPerRow {
+            memcpy(copyBase, sourceBase, sourceBytesPerRow * height)
+        } else {
+            let rowBytes = min(sourceBytesPerRow, copyBytesPerRow)
+            for row in 0..<height {
+                memcpy(
+                    copyBase.advanced(by: row * copyBytesPerRow),
+                    sourceBase.advanced(by: row * sourceBytesPerRow),
+                    rowBytes
+                )
+            }
+        }
+        return copy
+    }
+
+    /// Returns the source frame whose presentation covers `time`. During forward playback
+    /// the reader advances cheaply; on a backward seek or a large forward jump it reopens
+    /// near the target so scrubbing stays responsive.
+    func frame(at time: Double) -> CIImage {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let target = CMTime(value: CMTimeValue((time * 600).rounded()), timescale: 600)
+
+        let needsReset: Bool = {
+            guard reader?.status == .reading, let cur = current else { return true }
+            if target < cur.1 { return true }
+            let jumpSeconds = Double(target.value - cur.1.value) / 600.0
+            return jumpSeconds > 0.75
+        }()
+
+        if needsReset {
+            openReader(startingAt: CMTime(seconds: max(0, time - 0.1), preferredTimescale: 600))
+        }
+
+        if reader?.status == .reading {
+            if !started {
+                current = readNext()
+                lookahead = readNext()
+                started = true
+            }
+            while let next = lookahead, next.1 <= target {
+                current = next
+                lookahead = readNext()
+            }
+            if let cur = current {
+                return CIImage(cvPixelBuffer: cur.0)
+            }
+        }
+
+        if let cgImage = try? fallback.copyCGImage(at: target, actualTime: nil) {
+            return CIImage(cgImage: cgImage)
+        }
+        return CIImage(color: .init(cgColor: CGColor(gray: 0.2, alpha: 1.0)))
+    }
+}
+
+@MainActor
 class EditorVM: ObservableObject {
     @Published var project: RecordingProject
-    @Published var playheadTime: Double = 0
+
+    /// High-frequency playback position isolated on its own observable. `playheadTime`
+    /// remains the source of truth but is no longer @Published on this (fat) object, so
+    /// views that don't render the playhead — the inspector, toolbars, and the structural
+    /// timeline — are NOT invalidated ~24×/sec while a recording plays. Only views that
+    /// explicitly observe `playback` re-render per tick.
+    let playback = PlaybackClock()
+    var playheadTime: Double = 0 {
+        didSet {
+            guard playback.time != playheadTime else { return }
+            playback.time = playheadTime
+        }
+    }
     @Published var isPlaying = false
     @Published var zoomSegments: [ZoomSegment]
     @Published var editActions: [EditAction] = []
@@ -214,6 +382,7 @@ class EditorVM: ObservableObject {
     
     private var assetImageGenerator: AVAssetImageGenerator?
     private var asset: AVAsset?
+    private var previewFrameSource: PreviewFrameSource?
 
     init(project: RecordingProject) {
         let project = project.sanitizedForUse()
@@ -230,6 +399,17 @@ class EditorVM: ObservableObject {
             gen.requestedTimeToleranceAfter = CMTime(seconds: 0.04, preferredTimescale: 600)
             gen.requestedTimeToleranceBefore = CMTime(seconds: 0.04, preferredTimescale: 600)
             assetImageGenerator = gen
+
+            // Hardware-decoded sequential reader for smooth playback (≈34× faster than
+            // per-frame copyCGImage, which was the preview stutter at ~88 ms/frame). Built
+            // async; loadSourceFrame falls back to the generator until it is ready.
+            let sourceSize = self.sourceSize
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let source = await PreviewFrameSource.make(asset: a, sourceSize: sourceSize) {
+                    self.previewFrameSource = source
+                }
+            }
         }
 
         if project.webcamEnabled,
@@ -1966,21 +2146,33 @@ class EditorVM: ObservableObject {
     }
     
     // MARK: - Frame Rendering
-    
+
     func getFrame(at time: Double) -> CVPixelBuffer? {
+        guard let (inputs, config) = makeFrameInputs(at: time) else { return nil }
+        return renderer.renderFrame(inputs: inputs, config: config, outputSize: previewOutputSize)
+    }
+
+    /// The composited preview frame as a lazy `CIImage` graph (no rasterization). The
+    /// preview rasterizes this off the main thread (see VideoPreview), which keeps the
+    /// playback timer / UI responsive instead of blocking on a double Core Image render.
+    func previewFrameImage(at time: Double) -> CIImage? {
+        guard let (inputs, config) = makeFrameInputs(at: time) else { return nil }
+        return renderer.renderFrameImage(inputs: inputs, config: config, outputSize: previewOutputSize)
+    }
+
+    private func makeFrameInputs(at time: Double) -> (VideoRenderer.FrameInputs, StylePreset)? {
         guard let sourceFrame = loadSourceFrame(at: time) else { return nil }
-        
+
         let transform = frameTransform(at: time) ?? FrameTransform(
-                timestamp: 0,
-                transform: .identity,
-                sourceRect: .zero,
-                scale: 1.0,
-                isTransitioning: false,
-                transitionProgress: 0.0
-            )
+            timestamp: 0,
+            transform: .identity,
+            sourceRect: .zero,
+            scale: 1.0,
+            isTransitioning: false,
+            transitionProgress: 0.0
+        )
         let motionBlurVelocity = transformVelocity(at: time, current: transform)
-        
-        // Get cursor position for this time
+
         let cursorData = cursorFrame(at: time, frames: smoothedCursor)
         let cursorPosition = cursorData?.position
         let clickProgress = clickAnimationProgress(at: time, frames: smoothedCursor)
@@ -1992,31 +2184,27 @@ class EditorVM: ObservableObject {
             visibilityOverride: resolvedEffects.cursorVisibility
         )
         let config = previewStyleConfig(base: resolvedEffects.style)
-        
-        // Render frame
-        return renderer.renderFrame(
-            inputs: VideoRenderer.FrameInputs(
-                sourceFrame: sourceFrame,
-                timestamp: time,
-                zoomTransform: transform.transform,
-                cursorPosition: cursorPosition,
-                cursorVisible: cursorVisible,
-                cursorAlpha: 1.0,
-                cursorScale: config.cursorScale,
-                isClicking: cursorData?.isClicking ?? false,
-                clickAnimationProgress: clickProgress,
-                webcamFrame: resolvedEffects.webcamEnabled ? loadWebcamFrame(at: time) : nil,
-                activeShortcuts: resolvedEffects.showKeyboardShortcuts ? activeShortcuts(at: time, style: config) : [],
-                subtitleText: resolvedEffects.subtitlesEnabled ? activeSubtitle(at: time) : nil,
-                motionBlurVelocity: motionBlurVelocity,
-                activeOverlays: resolvedEffects.overlaysEnabled ? activeOverlays(at: time) : [],
-                activeTitleCards: activeTitleCards(at: time),
-                zoomScale: transform.scale,
-                cameraLayoutMode: activeCameraLayoutMode(at: time, webcamEnabled: resolvedEffects.webcamEnabled)
-            ),
-            config: config,
-            outputSize: previewOutputSize
+
+        let inputs = VideoRenderer.FrameInputs(
+            sourceFrame: sourceFrame,
+            timestamp: time,
+            zoomTransform: transform.transform,
+            cursorPosition: cursorPosition,
+            cursorVisible: cursorVisible,
+            cursorAlpha: 1.0,
+            cursorScale: config.cursorScale,
+            isClicking: cursorData?.isClicking ?? false,
+            clickAnimationProgress: clickProgress,
+            webcamFrame: resolvedEffects.webcamEnabled ? loadWebcamFrame(at: time) : nil,
+            activeShortcuts: resolvedEffects.showKeyboardShortcuts ? activeShortcuts(at: time, style: config) : [],
+            subtitleText: resolvedEffects.subtitlesEnabled ? activeSubtitle(at: time) : nil,
+            motionBlurVelocity: motionBlurVelocity,
+            activeOverlays: resolvedEffects.overlaysEnabled ? activeOverlays(at: time) : [],
+            activeTitleCards: activeTitleCards(at: time),
+            zoomScale: transform.scale,
+            cameraLayoutMode: activeCameraLayoutMode(at: time, webcamEnabled: resolvedEffects.webcamEnabled)
         )
+        return (inputs, config)
     }
 
     private func transformVelocity(at time: Double, current: FrameTransform) -> CGPoint {
@@ -2120,11 +2308,20 @@ class EditorVM: ObservableObject {
         if cachedSourceFrameTime == quantizedTime, let cachedSourceFrame {
             return cachedSourceFrame
         }
+        cachedSourceFrameTime = quantizedTime
 
+        // Fast path: sequential hardware decode via AVAssetReader (≈34× faster than the
+        // copyCGImage fallback below). Advances in playback order and resets on seek.
+        if let source = previewFrameSource {
+            let frame = source.frame(at: quantizedTime)
+            cachedSourceFrame = frame
+            return frame
+        }
+
+        // Fallback (reader not yet built or unavailable): per-frame copyCGImage.
         guard let gen = assetImageGenerator else {
             let fallback = CIImage(color: .init(cgColor: CGColor(gray: 0.2, alpha: 1.0)))
                 .cropped(to: CGRect(x: 0, y: 0, width: sourceWidth, height: sourceHeight))
-            cachedSourceFrameTime = quantizedTime
             cachedSourceFrame = fallback
             return fallback
         }
@@ -2133,13 +2330,11 @@ class EditorVM: ObservableObject {
         do {
             let cgImage = try gen.copyCGImage(at: cmTime, actualTime: nil)
             let frame = CIImage(cgImage: cgImage)
-            cachedSourceFrameTime = quantizedTime
             cachedSourceFrame = frame
             return frame
         } catch {
             let fallback = CIImage(color: .init(cgColor: CGColor(gray: 0.2, alpha: 1.0)))
                 .cropped(to: CGRect(x: 0, y: 0, width: sourceWidth, height: sourceHeight))
-            cachedSourceFrameTime = quantizedTime
             cachedSourceFrame = fallback
             return fallback
         }

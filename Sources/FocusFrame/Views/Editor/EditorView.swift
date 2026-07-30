@@ -6,8 +6,6 @@ struct EditorView: View {
     let project: RecordingProject
     @StateObject private var editorVM: EditorVM
     @StateObject private var exportVM: ExportVM
-    @State private var currentTime: Double = 0
-    @State private var resumePlaybackAfterScrub = false
     @State private var showingExportSheet = false
     @State private var showingCaptionEditor = false
     @State private var showingCommandPalette = false
@@ -34,17 +32,7 @@ struct EditorView: View {
                 ZStack {
                     Color.black
 
-                    if !editorVM.isLoadingProjectMedia {
-                        VideoPreview(time: currentTime, revision: editorVM.renderRevision) { time in
-                            editorVM.getFrame(at: time)
-                        }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .padding(18)
-                    } else {
-                        Image(systemName: "film.stack")
-                            .font(.system(size: 46, weight: .regular))
-                            .foregroundColor(.secondary.opacity(0.7))
-                    }
+                    EditorVideoStage(editorVM: editorVM)
 
                     if editorVM.isLoadingProjectMedia {
                         VStack(spacing: 8) {
@@ -57,10 +45,6 @@ struct EditorView: View {
                         .background(.regularMaterial)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                     }
-                }
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    toggleEditorPlayback()
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -119,9 +103,6 @@ struct EditorView: View {
             stopLocalKeyMonitor()
         }
         .onAppear(perform: startLocalKeyMonitor)
-        .onReceive(editorVM.$playheadTime) { newValue in
-            currentTime = newValue
-        }
         .onReceive(NotificationCenter.default.publisher(for: .shortcutPlayPause)) { _ in
             toggleEditorPlayback()
         }
@@ -287,10 +268,14 @@ struct EditorView: View {
                 Text(editorVM.project.title)
                     .font(.headline)
                     .lineLimit(1)
-                Text(finishStatusMessage ?? (formatTime(currentTime) + " / " + formatTime(editorVM.duration)))
-                    .font(.caption.monospacedDigit())
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
+                if let message = finishStatusMessage {
+                    Text(message)
+                        .font(.caption.monospacedDigit())
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                } else {
+                    EditorTimecodeLabel(editorVM: editorVM)
+                }
             }
 
             Spacer()
@@ -386,8 +371,8 @@ struct EditorView: View {
             Divider()
 
             Button {
-                editorVM.addZoomSegment(at: currentTime)
-                finishStatusMessage = "Zoom added at \(formatTime(currentTime))."
+                editorVM.addZoomSegment(at: editorVM.playheadTime)
+                finishStatusMessage = "Zoom added at \(formatTime(editorVM.playheadTime))."
             } label: {
                 Label("Add Zoom", systemImage: "plus.magnifyingglass")
             }
@@ -456,19 +441,19 @@ struct EditorView: View {
 
             Menu {
                 Button("Blur") {
-                    editorVM.addOverlay(type: .blur, at: currentTime)
+                    editorVM.addOverlay(type: .blur, at: editorVM.playheadTime)
                     finishStatusMessage = "Blur overlay added."
                 }
                 Button("Highlight") {
-                    editorVM.addOverlay(type: .highlight, at: currentTime)
+                    editorVM.addOverlay(type: .highlight, at: editorVM.playheadTime)
                     finishStatusMessage = "Highlight overlay added."
                 }
                 Button("Spotlight") {
-                    editorVM.addOverlay(type: .spotlight, at: currentTime)
+                    editorVM.addOverlay(type: .spotlight, at: editorVM.playheadTime)
                     finishStatusMessage = "Spotlight overlay added."
                 }
                 Button("Text Callout") {
-                    editorVM.addOverlay(type: .text, at: currentTime)
+                    editorVM.addOverlay(type: .text, at: editorVM.playheadTime)
                     finishStatusMessage = "Text callout added."
                 }
             } label: {
@@ -517,34 +502,7 @@ struct EditorView: View {
 
     private var editorTimeline: some View {
         VStack(spacing: 10) {
-            HStack(spacing: 12) {
-                Button {
-                    editorVM.togglePlayback()
-                } label: {
-                    Image(systemName: editorVM.isPlaying ? "pause.fill" : "play.fill")
-                        .frame(width: 28, height: 28)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.large)
-
-                Slider(value: $currentTime, in: 0...editorVM.duration) { editing in
-                    if editing {
-                        resumePlaybackAfterScrub = editorVM.isPlaying
-                        editorVM.pausePlayback()
-                    } else {
-                        editorVM.seek(to: currentTime)
-                        if resumePlaybackAfterScrub {
-                            editorVM.startPlayback()
-                        }
-                        resumePlaybackAfterScrub = false
-                    }
-                }
-
-                Text(formatTime(currentTime))
-                    .font(.caption.monospacedDigit())
-                    .foregroundColor(.secondary)
-                    .frame(width: 48, alignment: .trailing)
-            }
+            EditorTransportBar(editorVM: editorVM)
 
             TimelineView(editorVM: editorVM, compact: editorVM.selectedTool != .timeline)
 
@@ -689,39 +647,11 @@ private enum EditorKeyCode {
 private struct FullPreviewView: View {
     @ObservedObject var editorVM: EditorVM
     @Environment(\.dismiss) private var dismiss
-    @State private var currentTime: Double = 0
-    @State private var resumePlaybackAfterScrub = false
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                Button {
-                    editorVM.togglePlayback()
-                } label: {
-                    Image(systemName: editorVM.isPlaying ? "pause.fill" : "play.fill")
-                        .frame(width: 28, height: 28)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.large)
-
-                Slider(value: $currentTime, in: 0...editorVM.duration) { editing in
-                    if editing {
-                        resumePlaybackAfterScrub = editorVM.isPlaying
-                        editorVM.pausePlayback()
-                    } else {
-                        editorVM.seek(to: currentTime)
-                        if resumePlaybackAfterScrub {
-                            editorVM.startPlayback()
-                        }
-                        resumePlaybackAfterScrub = false
-                    }
-                }
-
-                Text(formatTime(currentTime))
-                    .font(.caption.monospacedDigit())
-                    .foregroundColor(.secondary)
-                    .frame(width: 52, alignment: .trailing)
-
+                EditorTransportBar(editorVM: editorVM)
                 Button {
                     dismiss()
                 } label: {
@@ -734,22 +664,109 @@ private struct FullPreviewView: View {
 
             ZStack {
                 Color.black
-                VideoPreview(time: currentTime, revision: editorVM.renderRevision) { time in
-                    editorVM.getFrame(at: time)
-                }
-                .padding(18)
+                EditorVideoStage(editorVM: editorVM)
             }
         }
         .frame(minWidth: 1120, minHeight: 720)
-        .onAppear {
-            currentTime = editorVM.playheadTime
-        }
         .onDisappear {
             editorVM.pausePlayback()
         }
-        .onReceive(editorVM.$playheadTime) { time in
-            currentTime = time
+    }
+}
+
+// MARK: - Playback-isolated subviews
+//
+// These are the ONLY editor views that observe the per-tick PlaybackClock. Because the
+// high-frequency playhead position no longer lives on the (fat) editor VM, the inspector,
+// toolbars, and structural timeline are not invalidated ~24x/sec while a recording plays —
+// which is what made the interface feel like ~15fps even though the video itself was fine.
+
+private struct EditorVideoStage: View {
+    @ObservedObject var editorVM: EditorVM
+    @ObservedObject private var playback: PlaybackClock
+
+    init(editorVM: EditorVM) {
+        self.editorVM = editorVM
+        self._playback = ObservedObject(wrappedValue: editorVM.playback)
+    }
+
+    var body: some View {
+        VideoPreview(time: playback.time, revision: editorVM.renderRevision) { time in
+            editorVM.previewFrameImage(at: time)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(18)
+        .contentShape(Rectangle())
+        .onTapGesture { editorVM.togglePlayback() }
+    }
+}
+
+private struct EditorTransportBar: View {
+    @ObservedObject var editorVM: EditorVM
+    @ObservedObject private var playback: PlaybackClock
+    @State private var resumeAfterScrub = false
+
+    init(editorVM: EditorVM) {
+        self.editorVM = editorVM
+        self._playback = ObservedObject(wrappedValue: editorVM.playback)
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Button {
+                editorVM.togglePlayback()
+            } label: {
+                Image(systemName: editorVM.isPlaying ? "pause.fill" : "play.fill")
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+
+            Slider(
+                value: Binding(
+                    get: { playback.time },
+                    set: { editorVM.seek(to: $0) }
+                ),
+                in: 0...max(editorVM.duration, 0.001)
+            ) { editing in
+                if editing {
+                    resumeAfterScrub = editorVM.isPlaying
+                    editorVM.pausePlayback()
+                } else {
+                    editorVM.seek(to: playback.time)
+                    if resumeAfterScrub {
+                        editorVM.startPlayback()
+                    }
+                    resumeAfterScrub = false
+                }
+            }
+
+            Text(formatTime(playback.time))
+                .font(.caption.monospacedDigit())
+                .foregroundColor(.secondary)
+                .frame(width: 48, alignment: .trailing)
+        }
+    }
+
+    private func formatTime(_ seconds: Double) -> String {
+        TimecodeFormatter.positional(seconds)
+    }
+}
+
+private struct EditorTimecodeLabel: View {
+    @ObservedObject var editorVM: EditorVM
+    @ObservedObject private var playback: PlaybackClock
+
+    init(editorVM: EditorVM) {
+        self.editorVM = editorVM
+        self._playback = ObservedObject(wrappedValue: editorVM.playback)
+    }
+
+    var body: some View {
+        Text(formatTime(playback.time) + " / " + formatTime(editorVM.duration))
+            .font(.caption.monospacedDigit())
+            .foregroundColor(.secondary)
+            .lineLimit(1)
     }
 
     private func formatTime(_ seconds: Double) -> String {

@@ -34,7 +34,6 @@ struct AudioWaveformView: View {
                 }
             }
         }
-        .frame(height: 60)
         .background(Color(nsColor: .controlBackgroundColor))
         .task(id: rawWaveformRequestID) {
             await loadWaveform()

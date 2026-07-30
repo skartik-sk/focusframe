@@ -216,6 +216,74 @@ final class AudioProcessorTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempURL2)
     }
 
+    /// The noise gate processes audio in fixed 8192-frame blocks. If its envelope follower
+    /// and high-pass filter state reset at every block boundary, the gate re-closes for a few
+    /// milliseconds at each boundary (every 8192/sampleRate ≈ 171 ms at 48 kHz ≈ 5.86 Hz) —
+    /// audible as a rhythmic flutter/jitter on the mic track. A steady tone well above the
+    /// gate threshold must come out steady, with no amplitude pumping at the block boundaries.
+    func testNoiseGateDoesNotPumpAtBlockBoundaries() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("audioprocessor-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let inputURL = directory.appendingPathComponent("tone.m4a")
+        let outputURL = directory.appendingPathComponent("tone-gated.m4a")
+        try createTestAudioFile(at: inputURL, duration: 2.0)
+
+        _ = try await AudioProcessor().applyNoiseGate(
+            inputURL: inputURL,
+            outputURL: outputURL,
+            threshold: -45
+        )
+
+        let readFile = try AVAudioFile(forReading: outputURL)
+        let readFormat = readFile.processingFormat
+        let totalFrames = AVAudioFrameCount(readFile.length)
+        XCTAssertGreaterThan(totalFrames, 0, "Noise gate produced no output")
+        guard totalFrames > 0 else { return }
+        let outputBuffer = AVAudioPCMBuffer(pcmFormat: readFormat, frameCapacity: totalFrames)!
+        try readFile.read(into: outputBuffer)
+        let samples = outputBuffer.floatChannelData![0]
+        let total = Int(outputBuffer.frameLength)
+        let sampleRate = readFormat.sampleRate
+
+        // RMS over a 4 ms window — long enough to average the test tone, short enough to
+        // surface the multi-ms gate re-close at a block boundary.
+        let block = 8192
+        let window = max(1, Int(sampleRate * 0.004))
+        func rms(_ start: Int) -> Float {
+            var sum: Float = 0
+            var count = 0
+            for index in start..<min(start + window, total) {
+                sum += samples[index] * samples[index]
+                count += 1
+            }
+            return sqrt(sum / Float(max(count, 1)))
+        }
+
+        var boundaryRMS: [Float] = []
+        var midRMS: [Float] = []
+        var position = block
+        while position + window + block / 2 < total {
+            boundaryRMS.append(rms(position))            // first 4 ms of a block (dips if state resets)
+            midRMS.append(rms(position + block / 2))     // middle of the same block (steady)
+            position += block
+        }
+
+        let boundaryMean = boundaryRMS.reduce(0, +) / Float(max(boundaryRMS.count, 1))
+        let midMean = midRMS.reduce(0, +) / Float(max(midRMS.count, 1))
+        let ratio = boundaryMean / max(midMean, 0.000_001)
+
+        print("[NoiseGate] blocks=\(boundaryRMS.count) boundaryRMS=\(boundaryMean) midRMS=\(midMean) ratio=\(ratio)")
+
+        XCTAssertFalse(boundaryRMS.isEmpty, "Gated output too short to evaluate")
+        XCTAssertGreaterThan(
+            ratio, 0.5,
+            "Noise gate pumps at 8192-frame block boundaries (boundary RMS \(boundaryMean) vs mid \(midMean), ratio \(ratio))"
+        )
+    }
+
     private func createTestAudioFile(at url: URL, duration: Double = 1.0) throws {
         if FileManager.default.fileExists(atPath: url.path) {
             try FileManager.default.removeItem(at: url)
