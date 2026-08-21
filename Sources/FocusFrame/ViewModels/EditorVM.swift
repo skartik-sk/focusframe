@@ -93,7 +93,10 @@ final class PreviewFrameSource: @unchecked Sendable {
         self.fallback = fallback
     }
 
-    static func make(asset: AVAsset, sourceSize: CGSize) async -> PreviewFrameSource? {
+    static func make(assetURL: URL, sourceSize: CGSize) async -> PreviewFrameSource? {
+        // Constructing the AVAsset here (not on the caller's actor) keeps ownership
+        // entirely inside this nonisolated context, avoiding any cross-isolation send.
+        let asset = AVAsset(url: assetURL)
         guard let track = try? await asset.loadTracks(withMediaType: .video).first else { return nil }
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
@@ -406,7 +409,7 @@ class EditorVM: ObservableObject {
             let sourceSize = self.sourceSize
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if let source = await PreviewFrameSource.make(asset: a, sourceSize: sourceSize) {
+                if let source = await PreviewFrameSource.make(assetURL: url, sourceSize: sourceSize) {
                     self.previewFrameSource = source
                 }
             }

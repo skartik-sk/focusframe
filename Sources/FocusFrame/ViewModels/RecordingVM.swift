@@ -3,6 +3,7 @@ import ScreenCaptureKit
 import Combine
 import AVFoundation
 import CoreGraphics
+import AppKit
 
 @MainActor
 class RecordingVM: ObservableObject {
@@ -224,7 +225,7 @@ class RecordingVM: ObservableObject {
                 } else {
                     micAudioActive = false
                     capturesMic = false
-                    lastErrorMessage = "Microphone permission is disabled. Recording will continue without microphone audio."
+                    lastErrorMessage = "Microphone access was denied. Enable it in System Settings → Privacy & Security → Microphone, then restart FocusFrame."
                 }
             } else {
                 micAudioActive = false
@@ -348,6 +349,14 @@ class RecordingVM: ObservableObject {
             )
             var projectWithNotes = project
             projectWithNotes.systemAudioEnabled = hasEmbeddedSystemAudio
+            // Default the editor background to the user's desktop wallpaper — a plain
+            // black backdrop looks flat, and the wallpaper matches their setup.
+            if let screen = NSScreen.main,
+               let wallpaperURL = NSWorkspace.shared.desktopImageURL(for: screen),
+               FileManager.default.fileExists(atPath: wallpaperURL.path) {
+                projectWithNotes.style.backgroundType = .image
+                projectWithNotes.style.backgroundImageURL = wallpaperURL
+            }
             let notes = speakerNotes.trimmingCharacters(in: .whitespacesAndNewlines)
             projectWithNotes.speakerNotes = notes.isEmpty ? nil : notes
             do {

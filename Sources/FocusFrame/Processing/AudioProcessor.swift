@@ -63,6 +63,45 @@ final class AudioProcessor: @unchecked Sendable {
     private func processPCM(inputURL: URL, outputURL: URL, config: Config) throws -> URL {
         let inputFile = try AVAudioFile(forReading: inputURL)
         let inputFormat = inputFile.processingFormat
+
+        // Whole-file processing lets the spectral noise reducer learn the noise profile
+        // from the quietest moments across the entire recording (two-pass), which is far
+        // more accurate than streaming estimates. Cap memory; very long files skip only
+        // the spectral stage and still get the gate/HPF/limiter chain.
+        let totalFrames = Int(inputFile.length)
+        let maxWholeFileFrames = 10 * 60 * Int(inputFormat.sampleRate)
+        let useSpectralStage = totalFrames > 0 && totalFrames <= maxWholeFileFrames
+
+        let channelCount = max(1, Int(inputFormat.channelCount))
+        var channelSamples = [[Float]](repeating: [], count: channelCount)
+        for index in 0..<channelCount {
+            channelSamples[index].reserveCapacity(totalFrames)
+        }
+
+        let chunkSize: AVAudioFrameCount = 8192
+        if useSpectralStage {
+            while inputFile.framePosition < inputFile.length {
+                let remaining = AVAudioFrameCount(inputFile.length - inputFile.framePosition)
+                guard let buffer = AVAudioPCMBuffer(
+                    pcmFormat: inputFormat,
+                    frameCapacity: min(chunkSize, remaining)
+                ) else { break }
+                try inputFile.read(into: buffer)
+                guard buffer.frameLength > 0 else { break }
+                if let channels = buffer.floatChannelData {
+                    for index in 0..<channelCount {
+                        channelSamples[index].append(
+                            contentsOf: UnsafeBufferPointer(start: channels[index], count: Int(buffer.frameLength))
+                        )
+                    }
+                }
+            }
+
+            for index in 0..<channelCount {
+                SpectralNoiseReducer().reduceNoise(samples: &channelSamples[index], sampleRate: Float(inputFormat.sampleRate))
+            }
+        }
+
         let outputSettings: [String: Any] = [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: inputFormat.sampleRate,
@@ -70,7 +109,7 @@ final class AudioProcessor: @unchecked Sendable {
             AVEncoderBitRateKey: 192_000
         ]
         let outputFile = try AVAudioFile(forWriting: outputURL, settings: outputSettings)
-        let chunkSize: AVAudioFrameCount = 8192
+
         let gateThreshold = pow(10.0, Double(Self.sanitizedNoiseGateThreshold(config.noiseGateThreshold)) / 20.0)
         let floorGain: Float = 0.06
         let makeupGain = Self.sanitizedMakeupGain(config.makeupGain)
@@ -78,82 +117,111 @@ final class AudioProcessor: @unchecked Sendable {
 
         // DSP state carried across blocks so the gate envelope and high-pass filter are
         // continuous. Resetting them per 8192-frame block pumps the gate at every boundary.
-        let channelCount = max(1, Int(inputFormat.channelCount))
         var envelopes = [Float](repeating: 0, count: channelCount)
         var hpfPreviousInputs = [Float](repeating: 0, count: channelCount)
         var hpfPreviousOutputs = [Float](repeating: 0, count: channelCount)
 
-        while inputFile.framePosition < inputFile.length {
-            guard let buffer = AVAudioPCMBuffer(
-                pcmFormat: inputFormat,
-                frameCapacity: min(chunkSize, AVAudioFrameCount(inputFile.length - inputFile.framePosition))
-            ) else {
-                break
-            }
-
-            try inputFile.read(into: buffer)
-            guard buffer.frameLength > 0 else { break }
+        func cleanupChannel(
+            _ channelIndex: Int,
+            frameLength: Int,
+            samples: UnsafeMutablePointer<Float>
+        ) {
             applyVoiceCleanup(
-                to: buffer,
+                channelIndex: channelIndex,
+                frameLength: frameLength,
+                sampleRate: Float(inputFormat.sampleRate),
                 threshold: Float(gateThreshold),
                 floorGain: floorGain,
                 makeupGain: makeupGain,
                 compressionRatio: compressionRatio,
-                envelopes: &envelopes,
-                hpfPreviousInputs: &hpfPreviousInputs,
-                hpfPreviousOutputs: &hpfPreviousOutputs
+                samples: samples,
+                envelope: &envelopes[channelIndex],
+                hpfPreviousInput: &hpfPreviousInputs[channelIndex],
+                hpfPreviousOutput: &hpfPreviousOutputs[channelIndex]
             )
-            try outputFile.write(from: buffer)
+        }
+
+        if useSpectralStage {
+            let capacity = AVAudioFrameCount(chunkSize)
+            guard let outBuffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: capacity) else {
+                throw AudioProcessorError.exportSessionUnavailable
+            }
+            var offset = 0
+            let totalFrames = channelSamples[0].count
+            while offset < totalFrames {
+                let length = min(Int(capacity), totalFrames - offset)
+                outBuffer.frameLength = AVAudioFrameCount(length)
+
+                for index in 0..<channelCount {
+                    channelSamples[index].withUnsafeMutableBufferPointer { destination in
+                        guard let base = destination.baseAddress else { return }
+                        cleanupChannel(index, frameLength: length, samples: base + offset)
+                        outBuffer.floatChannelData?[index].update(from: base + offset, count: length)
+                    }
+                }
+                try outputFile.write(from: outBuffer)
+                offset += length
+            }
+        } else {
+            inputFile.framePosition = 0
+            while inputFile.framePosition < inputFile.length {
+                let remaining = AVAudioFrameCount(inputFile.length - inputFile.framePosition)
+                guard let buffer = AVAudioPCMBuffer(
+                    pcmFormat: inputFormat,
+                    frameCapacity: min(chunkSize, remaining)
+                ) else { break }
+                try inputFile.read(into: buffer)
+                guard buffer.frameLength > 0 else { break }
+                guard let channels = buffer.floatChannelData else { break }
+                let frameLength = Int(buffer.frameLength)
+                for index in 0..<channelCount {
+                    cleanupChannel(index, frameLength: frameLength, samples: channels[index])
+                }
+                try outputFile.write(from: buffer)
+            }
         }
 
         return outputURL
     }
 
     private func applyVoiceCleanup(
-        to buffer: AVAudioPCMBuffer,
+        channelIndex: Int,
+        frameLength: Int,
+        sampleRate: Float,
         threshold: Float,
         floorGain: Float,
         makeupGain: Float,
         compressionRatio: Float,
-        envelopes: inout [Float],
-        hpfPreviousInputs: inout [Float],
-        hpfPreviousOutputs: inout [Float]
+        samples: UnsafeMutablePointer<Float>,
+        envelope: inout Float,
+        hpfPreviousInput: inout Float,
+        hpfPreviousOutput: inout Float
     ) {
-        guard let channels = buffer.floatChannelData else { return }
-        let channelCount = Int(buffer.format.channelCount)
-        let frameLength = Int(buffer.frameLength)
-        guard frameLength > 0 else { return }
-        let sampleRate = Float(buffer.format.sampleRate)
         let attackCoefficient = envelopeCoefficient(milliseconds: 8, sampleRate: sampleRate)
         let releaseCoefficient = envelopeCoefficient(milliseconds: 120, sampleRate: sampleRate)
         let ratio = max(1, compressionRatio)
 
-        for channelIndex in 0..<channelCount {
-            let samples = channels[channelIndex]
-            applyHighPassFilter(
-                to: samples,
-                frameLength: frameLength,
-                sampleRate: sampleRate,
-                cutoff: 85,
-                previousInput: &hpfPreviousInputs[channelIndex],
-                previousOutput: &hpfPreviousOutputs[channelIndex]
-            )
-            let adaptiveThreshold = min(0.08, max(threshold, estimateNoiseFloor(samples: samples, frameLength: frameLength) * 1.7))
-            let closeThreshold = adaptiveThreshold * 0.55
-            // Envelope is carried across blocks; resetting it to 0 per block re-closes the
-            // gate for several ms at every boundary (audible ~6 Hz flutter).
-            var envelope = envelopes[channelIndex]
-            for frame in 0..<frameLength {
-                let sample = samples[frame]
-                let rectified = abs(sample)
-                let coefficient = rectified > envelope ? attackCoefficient : releaseCoefficient
-                envelope = coefficient * envelope + (1 - coefficient) * rectified
-                let openness = smoothstep((envelope - closeThreshold) / max(adaptiveThreshold - closeThreshold, 0.000_001))
-                let gateGain = floorGain + (1 - floorGain) * openness
-                let cleaned = sample * gateGain * makeupGain
-                samples[frame] = softLimit(cleaned, ratio: ratio)
-            }
-            envelopes[channelIndex] = envelope
+        applyHighPassFilter(
+            to: samples,
+            frameLength: frameLength,
+            sampleRate: sampleRate,
+            cutoff: 85,
+            previousInput: &hpfPreviousInput,
+            previousOutput: &hpfPreviousOutput
+        )
+        let adaptiveThreshold = min(0.08, max(threshold, estimateNoiseFloor(samples: samples, frameLength: frameLength) * 1.7))
+        let closeThreshold = adaptiveThreshold * 0.55
+        // Envelope is carried across blocks; resetting it to 0 per block re-closes the
+        // gate for several ms at every boundary (audible ~6 Hz flutter).
+        for frame in 0..<frameLength {
+            let sample = samples[frame]
+            let rectified = abs(sample)
+            let coefficient = rectified > envelope ? attackCoefficient : releaseCoefficient
+            envelope = coefficient * envelope + (1 - coefficient) * rectified
+            let openness = smoothstep((envelope - closeThreshold) / max(adaptiveThreshold - closeThreshold, 0.000_001))
+            let gateGain = floorGain + (1 - floorGain) * openness
+            let cleaned = sample * gateGain * makeupGain
+            samples[frame] = softLimit(cleaned, ratio: ratio)
         }
     }
 
@@ -280,6 +348,56 @@ final class AudioProcessor: @unchecked Sendable {
         }
 
         return outputURL
+    }
+
+    /// Applies linear gain to an audio file with soft limiting to prevent harsh clipping.
+    /// Used for volume boost (>1×) because AVAudioMix.setVolume clamps at 1.0.
+    func applyLinearGain(inputURL: URL, outputURL: URL, gain: Float) async throws -> URL {
+        guard FileManager.default.fileExists(atPath: inputURL.path) else {
+            throw AudioProcessorError.inputNotFound
+        }
+        try removeExistingFile(at: outputURL)
+
+        return try await Task.detached(priority: .userInitiated) {
+            let inputFile = try AVAudioFile(forReading: inputURL)
+            let format = inputFile.processingFormat
+            let outputSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: format.sampleRate,
+                AVNumberOfChannelsKey: Int(format.channelCount),
+                AVEncoderBitRateKey: 192_000
+            ]
+            let outputFile = try AVAudioFile(forWriting: outputURL, settings: outputSettings)
+
+            let chunkSize: AVAudioFrameCount = 8192
+            while inputFile.framePosition < inputFile.length {
+                let remaining = AVAudioFrameCount(inputFile.length - inputFile.framePosition)
+                guard let buffer = AVAudioPCMBuffer(
+                    pcmFormat: format,
+                    frameCapacity: min(chunkSize, remaining)
+                ) else { break }
+                try inputFile.read(into: buffer)
+                guard buffer.frameLength > 0, let channels = buffer.floatChannelData else { break }
+
+                let frameLength = Int(buffer.frameLength)
+                for channel in 0..<Int(format.channelCount) {
+                    let samples = channels[channel]
+                    for frame in 0..<frameLength {
+                        // Soft-knee limiter keeps boosted audio from hard-clipping.
+                        let amplified = samples[frame] * gain
+                        let magnitude = abs(amplified)
+                        if magnitude > 0.95 {
+                            let limited = 0.95 + (magnitude - 0.95) / max(gain, 1.5)
+                            samples[frame] = amplified.sign == .minus ? -limited : limited
+                        } else {
+                            samples[frame] = amplified
+                        }
+                    }
+                }
+                try outputFile.write(from: buffer)
+            }
+            return outputURL
+        }.value
     }
 
     private func removeExistingFile(at url: URL) throws {

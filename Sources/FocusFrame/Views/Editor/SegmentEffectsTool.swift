@@ -160,7 +160,7 @@ struct SegmentEffectsTool: View {
                         get: { Double(value ?? fallback) },
                         set: { onChange(Float($0)) }
                     ),
-                    range: 0...1,
+                    range: 0...8,
                     labelWidth: 0,
                     valueWidth: 42,
                     formatter: { String(format: "%.0f%%", $0 * 100) }

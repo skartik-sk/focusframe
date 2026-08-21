@@ -25,10 +25,41 @@ enum SoundEffectLibrary {
     }
 
     private static func bundledURL(named name: String, extension fileExtension: String) -> URL? {
-        Bundle.module.url(forResource: name, withExtension: fileExtension, subdirectory: "Sounds")
-            ?? Bundle.module.url(forResource: name, withExtension: fileExtension)
+        // NOTE: Deliberately avoids `Bundle.module`. The SwiftPM-generated accessor
+        // calls fatalError() when the resource bundle is missing (e.g. an app bundle
+        // packaged without FocusFrame_FocusFrame.bundle), which crashed the whole app
+        // mid-export. This resolver degrades gracefully instead.
+        let candidates = [
+            Bundle.main.resourceURL,
+            Bundle(for: BundleMarker.self).resourceURL,
+            Bundle.main.bundleURL,
+        ]
+
+        for candidate in candidates.compactMap({ $0 }) {
+            let bundlePath = candidate.appendingPathComponent("FocusFrame_FocusFrame.bundle")
+            guard FileManager.default.fileExists(atPath: bundlePath.path),
+                  let bundle = Bundle(url: bundlePath) else { continue }
+            if let url = bundle.url(forResource: name, withExtension: fileExtension, subdirectory: "Sounds") {
+                return url
+            }
+            if let url = bundle.url(forResource: name, withExtension: fileExtension) {
+                return url
+            }
+        }
+
+        // Development fallback: run straight from the source tree.
+        let sourceFallback = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Resources/Sounds/\(name).\(fileExtension)")
+        if FileManager.default.fileExists(atPath: sourceFallback.path) { return sourceFallback }
+
+        return nil
     }
 }
+
+private final class BundleMarker {}
 
 enum SoundEffectMixer {
     static let sampleRate = 44_100.0

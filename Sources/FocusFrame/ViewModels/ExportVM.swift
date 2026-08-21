@@ -1284,13 +1284,16 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
 
         let screenAudioURL = project.systemAudioFileURL ?? project.videoFileURL
         if let editedSourceAudio = try? await renderEditedAudioTrack(from: screenAudioURL, timeline: timeline) {
+            // Boost >1× is applied as real PCM gain because AVAudioMix caps at 1.0.
+            let requestedVolume = project.style.sourceAudioVolume
+            let boostedSource = await boostedTrack(editedSourceAudio, volume: requestedVolume)
             preparedTracks.append(PreparedAudioTrack(
-                url: editedSourceAudio,
+                url: boostedSource,
                 volumeAutomation: volumeAutomation(
                     for: project,
                     timeline: timeline,
-                    baseVolume: project.style.sourceAudioVolume,
-                    volume: { $0.sourceAudioVolume }
+                    baseVolume: min(requestedVolume, 1),
+                    volume: { min($0.sourceAudioVolume, 1) }
                 ),
                 isTemporary: true
             ))
@@ -1298,7 +1301,7 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
 
         if let micURL = project.micAudioFileURL,
            let editedMicAudio = try? await renderEditedAudioTrack(from: micURL, timeline: timeline) {
-            let finalMicAudio: URL
+            var finalMicAudio: URL
             if project.style.micNoiseReductionEnabled,
                let processedMicURL = try? await AudioProcessor().applyNoiseGate(
                     inputURL: editedMicAudio,
@@ -1311,13 +1314,16 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
             } else {
                 finalMicAudio = editedMicAudio
             }
+            // Boost >1× is applied as real PCM gain because AVAudioMix caps at 1.0.
+            let requestedMicVolume = project.style.micAudioVolume
+            finalMicAudio = await boostedTrack(finalMicAudio, volume: requestedMicVolume)
             preparedTracks.append(PreparedAudioTrack(
                 url: finalMicAudio,
                 volumeAutomation: volumeAutomation(
                     for: project,
                     timeline: timeline,
-                    baseVolume: project.style.micAudioVolume,
-                    volume: { $0.micAudioVolume }
+                    baseVolume: min(requestedMicVolume, 1),
+                    volume: { min($0.micAudioVolume, 1) }
                 ),
                 isTemporary: true
             ))
@@ -1977,6 +1983,26 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
         return outputURL
     }
 
+    /// Applies real PCM gain when a track's volume exceeds 1× (AVAudioMix caps at 1.0).
+    private func boostedTrack(_ url: URL, volume: Float) async -> URL {
+        guard volume > 1.001 else { return url }
+        let boostedURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("track-boosted-\(UUID().uuidString).m4a")
+        do {
+            let result = try await AudioProcessor().applyLinearGain(
+                inputURL: url,
+                outputURL: boostedURL,
+                gain: volume
+            )
+            try? FileManager.default.removeItem(at: url)
+            return result
+        } catch {
+            print("Track boost failed, using unboosted audio: \(error)")
+            try? FileManager.default.removeItem(at: boostedURL)
+            return url
+        }
+    }
+
     private func mixAudioTracks(
         trackURLs: [URL],
         outputURL: URL,
@@ -2179,7 +2205,9 @@ final class ExportVM: ObservableObject, @unchecked Sendable {
 
     nonisolated static func clampedAudioVolume(_ volume: Float) -> Float {
         guard volume.isFinite else { return 0 }
-        return max(0, min(volume, 1))
+        // Up to 8× for very quiet sources (e.g. Bluetooth mics). Values >1 are applied
+        // as real PCM gain before mixing; the mix itself only ever sees ≤1.
+        return max(0, min(volume, 8))
     }
 
     nonisolated static func sanitizedProfile(_ profile: ExportProfile) -> ExportProfile {

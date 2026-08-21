@@ -247,6 +247,6 @@ enum EffectSegmentResolver {
     }
 
     private static func clampedVolume(_ value: Float) -> Float {
-        max(0, min(value, 1))
+        max(0, min(value, 8))
     }
 }

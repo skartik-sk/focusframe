@@ -4,11 +4,36 @@ import AppKit
 @main
 struct FocusFrameApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    
+
+    init() {
+        // Headless modes (no UI): export a recording, or clean a single audio file.
+        if let cleanIndex = CommandLine.arguments.firstIndex(of: "--clean-audio"),
+           cleanIndex + 2 < CommandLine.arguments.count {
+            let input = URL(fileURLWithPath: (CommandLine.arguments[cleanIndex + 1] as NSString).expandingTildeInPath)
+            let output = URL(fileURLWithPath: (CommandLine.arguments[cleanIndex + 2] as NSString).expandingTildeInPath)
+            Task { @MainActor in
+                do {
+                    _ = try await AudioProcessor().applyNoiseGate(inputURL: input, outputURL: output)
+                    print("DONE \(output.path)")
+                    exit(0)
+                } catch {
+                    FileHandle.standardError.write("FAILED: \(error)\n".data(using: .utf8)!)
+                    exit(1)
+                }
+            }
+        } else if let configuration = HeadlessExport.configuration {
+            Task { @MainActor in
+                await HeadlessExport.runAndExit(configuration)
+            }
+        }
+    }
+
     var body: some Scene {
         WindowGroup {
-            HomeView()
-                .frame(minWidth: 800, minHeight: 600)
+            if !HeadlessExport.isActive {
+                HomeView()
+                    .frame(minWidth: 800, minHeight: 600)
+            }
         }
         .windowStyle(.titleBar)
         .windowResizability(.contentSize)
@@ -23,11 +48,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var isPaused = false
 
     func applicationWillFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
+        if HeadlessExport.isActive {
+            // Headless mode: never become a visible app — no Dock, no windows, no UI.
+            NSApp.setActivationPolicy(.prohibited)
+        } else {
+            NSApp.setActivationPolicy(.regular)
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard !HeadlessExport.isActive else { return }
         setupMenuBar()
+        // Register with TCC right away so FocusFrame appears under
+        // System Settings → Privacy & Security → Input Monitoring, and the
+        // system prompt is raised on first launch instead of silently failing.
+        KeyboardCapturePermissions.requestInputMonitoring()
         KeyboardShortcutManager.shared.startMonitoring()
         NotificationCenter.default.addObserver(
             self,

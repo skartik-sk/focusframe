@@ -447,9 +447,9 @@ struct EditorInspectorView: View {
                     }
 
                     inspectorSection("Audio") {
-                        valueSlider("Screen Vol", value: styleBinding(\.sourceAudioVolume), range: 0...1, suffix: "")
+                        valueSlider("Screen Vol", value: styleBinding(\.sourceAudioVolume), range: 0...8, suffix: "×")
                         if editorVM.project.micAudioFileURL != nil {
-                            valueSlider("Mic Vol", value: styleBinding(\.micAudioVolume), range: 0...1, suffix: "")
+                            valueSlider("Mic Vol", value: styleBinding(\.micAudioVolume), range: 0...8, suffix: "×")
                         } else {
                             Text("No microphone track in this project.")
                                 .font(.caption)

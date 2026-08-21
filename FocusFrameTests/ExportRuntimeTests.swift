@@ -855,6 +855,38 @@ final class ExportRuntimeTests: XCTestCase {
         XCTAssertTrue(skipped.isEmpty, "Export skipped frames at gaps \(skipped); diffs \(differences)")
     }
 
+    /// One-off rescue export of the crucial CAF23480 recording.
+    /// Run with:
+    ///   FOCUSFRAME_EXPORT_CAF23480=1 swift test --filter testExportCAF23480Recording
+    @MainActor
+    func testExportCAF23480Recording() async throws {
+        guard ProcessInfo.processInfo.environment["FOCUSFRAME_EXPORT_CAF23480"] == "1" else {
+            throw XCTSkip("Set FOCUSFRAME_EXPORT_CAF23480=1 to run the rescue export.")
+        }
+
+        let projects = try FileManager.default.loadRecordingProjects()
+        let project = try XCTUnwrap(
+            projects.first(where: { $0.id.uuidString == "CAF23480-C399-47E6-992A-1FD619D79A47" }),
+            "Recording not found"
+        )
+
+        let desktop = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Desktop", isDirectory: true)
+        let outputURL = desktop.appendingPathComponent("FocusFrame-rescue-export-1080p.mp4")
+
+        let exportVM = ExportVM()
+        exportVM.outputURL = outputURL
+
+        let start = Date()
+        let exportedURL = try await exportVM.export(project: project, profile: .web1080p)
+        let elapsed = Date().timeIntervalSince(start)
+        let attributes = try FileManager.default.attributesOfItem(atPath: exportedURL.path)
+        let sizeMB = Double((attributes[.size] as? NSNumber)?.int64Value ?? 0) / 1_000_000
+
+        print("[RescueExport] wrote \(exportedURL.path) (\(String(format: "%.1f", sizeMB)) MB in \(String(format: "%.0f", elapsed))s)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: exportedURL.path))
+    }
+
     /// Exports a real local recording into the repo's `video/` folder using the fixed
     /// pipeline, so the output can be inspected for frame drops. Gated behind an env var so
     /// it never runs in the normal suite. Run with:

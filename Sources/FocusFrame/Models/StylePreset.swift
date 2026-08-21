@@ -402,8 +402,8 @@ struct StylePreset: Codable {
         backgroundMusicFadeIn = Self.clamped(backgroundMusicFadeIn, fallback: 0.6, range: 0...5)
         backgroundMusicFadeOut = Self.clamped(backgroundMusicFadeOut, fallback: 0.8, range: 0...5)
         backgroundMusicDuckingVolume = Self.clamped(backgroundMusicDuckingVolume, fallback: 0.18, range: 0...1)
-        sourceAudioVolume = Self.clamped(sourceAudioVolume, fallback: 1, range: 0...1)
-        micAudioVolume = Self.clamped(micAudioVolume, fallback: 1, range: 0...1)
+        sourceAudioVolume = Self.clamped(sourceAudioVolume, fallback: 1, range: 0...8)
+        micAudioVolume = Self.clamped(micAudioVolume, fallback: 1, range: 0...8)
         micNoiseGateThreshold = Self.clamped(micNoiseGateThreshold, fallback: -45, range: -65 ... -25)
 
         webcamSize = Self.clamped(webcamSize, fallback: 220, range: 96...420)

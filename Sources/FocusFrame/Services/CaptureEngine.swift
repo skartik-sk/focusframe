@@ -22,7 +22,9 @@ class CaptureEngine: NSObject, @unchecked Sendable {
     private var writerStarted = false
     private var isPaused = false
     
-    struct Config {
+    // @unchecked: `display` is an immutable ScreenCaptureKit content descriptor that is
+    // only read while configuring the stream, never mutated after Config is built.
+    struct Config: @unchecked Sendable {
         var display: SCDisplay
         var captureRect: CGRect?       // nil = full display
         var minimumFrameRate: Int = 30

@@ -1,6 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
+# Prefer a user-installed Swift.org toolchain when the system CommandLineTools
+# SwiftPM is broken (stale ManifestAPI). Harmless if only CLT is present.
+for tc in "$HOME"/Library/Developer/Toolchains/*.xctoolchain; do
+    if [ -x "$tc/usr/bin/swift" ]; then
+        export PATH="$tc/usr/bin:$PATH"
+        break
+    fi
+done
+
 APP_NAME="FocusFrame"
 CONFIGURATION="debug"
 PACKAGE_ZIP=0
@@ -56,7 +65,7 @@ fi
 tail -3 "$BUILD_LOG"
 rm -f "$BUILD_LOG"
 
-EXECUTABLE=".build/$CONFIGURATION/FocusFrame"
+EXECUTABLE="$(swift build -c "$CONFIGURATION" --show-bin-path)/FocusFrame"
 
 if [ ! -f "$EXECUTABLE" ]; then
     echo "Error: Build product not found at $EXECUTABLE"
@@ -72,9 +81,13 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 cp "$EXECUTABLE" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
-RESOURCE_BUNDLE=".build/$CONFIGURATION/FocusFrame_FocusFrame.bundle"
+RESOURCE_BUNDLE="$(swift build -c "$CONFIGURATION" --show-bin-path)/FocusFrame_FocusFrame.bundle"
 if [ -d "$RESOURCE_BUNDLE" ]; then
     cp -R "$RESOURCE_BUNDLE" "$APP_BUNDLE/Contents/Resources/"
+else
+    echo "ERROR: resource bundle missing at $RESOURCE_BUNDLE"
+    echo "The app would crash on export without it (Bundle.module fatalError). Aborting."
+    exit 1
 fi
 
 ICON_FILE="Sources/FocusFrame/Resources/FocusFrame.icns"
