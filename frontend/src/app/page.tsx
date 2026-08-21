@@ -42,7 +42,7 @@ const featureBlocks: Array<{
   },
 ];
 
-const downloadHref = "/FocusFrame-1.0-macOS.zip";
+const downloadHref = "/FocusFrame-1.2-macOS.zip";
 
 const heroSignals = ["Free forever", "No login", "Local export"];
 
