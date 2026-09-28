@@ -216,6 +216,10 @@ class RecordingVM: ObservableObject {
                             try recorder.start(outputURL: micURL, device: selectedDevice)
                         }.value
                         micAudioActive = true
+                        if let notice = recorder.lastFallbackNotice {
+                            lastErrorMessage = notice
+                            print(notice)
+                        }
                     } catch {
                         micAudioActive = false
                         capturesMic = false
